@@ -140,24 +140,31 @@ async def extract_info(query):
     return await loop.run_in_executor(None, extract)
 
 
-async def search_text(text):
+async def search_text(text, skip_youtube=False):
     """Busca por texto: tenta YouTube e, se falhar, SoundCloud."""
-    try:
-        return await extract_info(f"ytsearch1:{text}")
-    except Exception as yt_error:
-        log.warning(
-            "Busca no YouTube falhou (%s). Tentando SoundCloud...",
-            clean_error(yt_error),
-        )
+    yt_error = None
+
+    if not skip_youtube:
         try:
-            return await extract_info(f"scsearch1:{text}")
-        except Exception as sc_error:
-            log.error(
-                "Busca no SoundCloud também falhou: %s",
-                clean_error(sc_error),
+            return await extract_info(f"ytsearch1:{text}")
+        except Exception as error:
+            yt_error = error
+            log.warning(
+                "Busca no YouTube falhou (%s). Tentando SoundCloud...",
+                clean_error(error),
             )
-            # Mantém o erro do YouTube, que explica melhor o motivo.
+
+    try:
+        return await extract_info(f"scsearch1:{text}")
+    except Exception as sc_error:
+        log.error(
+            "Busca no SoundCloud falhou: %s",
+            clean_error(sc_error),
+        )
+        # Mantém o erro do YouTube, que explica melhor o motivo.
+        if yt_error:
             raise yt_error from sc_error
+        raise
 
 
 def clean_error(error):
@@ -200,6 +207,44 @@ def clean_spotify_title(title):
     return re.sub(r"\s+", " ", title).strip()
 
 
+YOUTUBE_RE = re.compile(r"(youtube\.com|youtu\.be)", re.I)
+
+
+async def youtube_oembed_title(url):
+    """Pega o título de um vídeo do YouTube sem passar pelo bloqueio."""
+    api = (
+        "https://www.youtube.com/oembed?format=json&url="
+        + quote(url, safe="")
+    )
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            api,
+            timeout=aiohttp.ClientTimeout(total=10),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as response:
+            if response.status != 200:
+                raise ValueError("Não consegui ler os dados do vídeo.")
+            data = await response.json()
+
+    title = data.get("title")
+    if not title:
+        raise ValueError("Não consegui identificar a música.")
+    return title
+
+
+def clean_video_title(title):
+    """Remove '(Official Video)', '[Lyrics]' etc. do título."""
+    title = re.sub(
+        r"\s*[\(\[][^\)\]]*"
+        r"(official|video|audio|lyrics?|clipe|hd|4k)"
+        r"[^\)\]]*[\)\]]",
+        "",
+        title,
+        flags=re.I,
+    )
+    return re.sub(r"\s+", " ", title).strip()
+
+
 async def resolve_track(query, requester):
     is_link = query.startswith(("http://", "https://"))
 
@@ -232,10 +277,22 @@ async def resolve_track(query, requester):
 
         reason = friendly_reason(original_error)
 
-        # Se for um link de outra plataforma (ex.: Spotify), tenta
-        # identificar o título da página e procurar uma versão
-        # reproduzível no YouTube.
         try:
+            # Link do YouTube bloqueado: pega o título pelo oEmbed
+            # e procura a música no SoundCloud.
+            if YOUTUBE_RE.search(query):
+                title = clean_video_title(
+                    await youtube_oembed_title(query)
+                )
+                log.info(
+                    "YouTube bloqueado; buscando %r no SoundCloud",
+                    title,
+                )
+                info = await search_text(title, skip_youtube=True)
+                return Track(info, requester)
+
+            # Link de outra plataforma (ex.: Spotify): lê o título
+            # da página e procura uma versão reproduzível.
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     query,
@@ -269,8 +326,6 @@ async def resolve_track(query, requester):
             if "spotify.com" in query:
                 title = clean_spotify_title(title)
 
-            # Tenta incluir o artista (og:description do Spotify
-            # costuma começar com "Artista · Música · ...").
             desc = re.search(
                 r'<meta[^>]+property=["\']og:description["\']'
                 r'[^>]+content=["\']([^"\']+)',
