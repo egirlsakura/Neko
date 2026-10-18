@@ -1,5 +1,7 @@
 import os
 import re
+import time
+import sqlite3
 import html as html_module
 import asyncio
 import random
@@ -17,7 +19,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-MAX_QUEUE = 100
+MAX_QUEUE = 100             # máximo de faixas na fila
+MAX_PLAYLIST_TRACKS = 100   # máximo carregado de uma playlist por link
+MAX_SAVED_TRACKS = 200      # máximo de faixas em uma playlist salva
+
+# Banco das playlists criadas pelo bot (SQLite, arquivo local).
+DB_PATH = os.getenv("PLAYLIST_DB", "playlists.db")
+
+# Opcional: necessário só para playlists/álbuns do Spotify.
+# Crie um app em https://developer.spotify.com/dashboard
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
 # Opcional: arquivo de cookies do YouTube (formato Netscape).
 # Só é usado se o arquivo existir. Útil quando o YouTube pede
@@ -72,14 +84,23 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 
 class Track:
+    """Uma faixa da fila.
+
+    Se `url` (stream) ainda não existe, a faixa é "preguiçosa":
+    o áudio só é buscado na hora de tocar (ensure_stream). Isso
+    permite carregar playlists grandes sem esperar cada música.
+    """
+
     def __init__(self, data, requester):
-        self.title = data.get("title", "Faixa desconhecida")
+        self.title = data.get("title") or "Faixa desconhecida"
         self.url = (
             data.get("webpage_url")
             or data.get("original_url")
             or ""
         )
-        self.stream = data["url"]
+        self.stream = data.get("url")
+        # Link ou texto usado para (re)buscar a faixa depois.
+        self.query = data.get("query") or self.url or self.title
         self.duration = data.get("duration") or 0
         self.artist = (
             data.get("uploader")
@@ -88,6 +109,18 @@ class Track:
         )
         self.thumbnail = data.get("thumbnail")
         self.requester = requester
+
+    async def ensure_stream(self):
+        if self.stream:
+            return
+
+        resolved = await resolve_track(self.query, self.requester)
+        self.stream = resolved.stream
+        self.title = resolved.title
+        self.url = resolved.url
+        self.duration = resolved.duration
+        self.artist = resolved.artist
+        self.thumbnail = resolved.thumbnail
 
 
 class MusicPlayer:
@@ -212,6 +245,18 @@ def clean_spotify_title(title):
 
 
 YOUTUBE_RE = re.compile(r"(youtube\.com|youtu\.be)", re.I)
+
+# Links que são, por si só, uma playlist/álbum inteiro.
+PLAYLIST_URL_RE = re.compile(
+    r"(youtube\.com/playlist\?"
+    r"|soundcloud\.com/[^/\s]+/sets/"
+    r"|open\.spotify\.com/(?:[\w-]+/)?(?:playlist|album)/)",
+    re.I,
+)
+
+
+def is_playlist_url(url):
+    return bool(PLAYLIST_URL_RE.search(url))
 
 
 async def youtube_oembed_title(url):
@@ -361,6 +406,428 @@ async def resolve_track(query, requester):
             ) from fallback_error
 
 
+# ---------------------------------------------------------------
+# Playlists por link (YouTube, SoundCloud, Spotify)
+# ---------------------------------------------------------------
+
+_spotify_token = {"value": None, "expires": 0}
+
+
+async def spotify_token():
+    now = time.time()
+    if (
+        _spotify_token["value"]
+        and now < _spotify_token["expires"] - 30
+    ):
+        return _spotify_token["value"]
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "client_credentials"},
+            auth=aiohttp.BasicAuth(
+                SPOTIFY_CLIENT_ID,
+                SPOTIFY_CLIENT_SECRET,
+            ),
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as response:
+            if response.status != 200:
+                raise ValueError(
+                    "Não consegui autenticar no Spotify. "
+                    "Confira o Client ID e o Client Secret."
+                )
+            data = await response.json()
+
+    _spotify_token["value"] = data["access_token"]
+    _spotify_token["expires"] = now + int(data.get("expires_in", 3600))
+    return _spotify_token["value"]
+
+
+async def expand_spotify(url, requester):
+    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        raise ValueError(
+            "Para playlists e álbuns do Spotify, configure "
+            "SPOTIFY_CLIENT_ID e SPOTIFY_CLIENT_SECRET nas variáveis "
+            "do bot (https://developer.spotify.com/dashboard)."
+        )
+
+    match = re.search(
+        r"spotify\.com/(?:[\w-]+/)?(playlist|album)/([A-Za-z0-9]+)",
+        url,
+    )
+    if not match:
+        raise ValueError("Link do Spotify não reconhecido.")
+
+    kind, spotify_id = match.groups()
+    headers = {"Authorization": f"Bearer {await spotify_token()}"}
+    api = (
+        f"https://api.spotify.com/v1/{kind}s/{spotify_id}/tracks"
+        "?limit=50"
+    )
+
+    tracks = []
+
+    async with aiohttp.ClientSession() as session:
+        while api and len(tracks) < MAX_PLAYLIST_TRACKS:
+            async with session.get(
+                api,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as response:
+                if response.status in (403, 404):
+                    raise ValueError(
+                        "O Spotify não liberou essa playlist "
+                        "(pode ser privada ou restrita)."
+                    )
+                if response.status != 200:
+                    raise ValueError(
+                        f"Erro ao consultar o Spotify "
+                        f"({response.status})."
+                    )
+                data = await response.json()
+
+            for item in data.get("items", []):
+                track = item.get("track") if kind == "playlist" else item
+                if not track or not track.get("name"):
+                    continue
+
+                artist = (track.get("artists") or [{}])[0].get("name", "")
+                text = f"{artist} {track['name']}".strip()
+                tracks.append(
+                    Track(
+                        {
+                            "title": text,
+                            "query": text,
+                            "uploader": artist,
+                            "duration": (
+                                (track.get("duration_ms") or 0) // 1000
+                            ),
+                        },
+                        requester,
+                    )
+                )
+
+            api = data.get("next")
+
+    if not tracks:
+        raise ValueError("Nenhuma faixa encontrada nessa playlist.")
+
+    label = "Playlist do Spotify" if kind == "playlist" else "Álbum do Spotify"
+    return tracks[:MAX_PLAYLIST_TRACKS], label
+
+
+async def expand_playlist(url, requester):
+    """Transforma um link de playlist em faixas (carregadas depois)."""
+    if "spotify.com" in url:
+        return await expand_spotify(url, requester)
+
+    is_youtube = bool(YOUTUBE_RE.search(url))
+
+    if is_youtube:
+        match = re.search(r"[?&]list=([\w-]+)", url)
+        if match:
+            url = f"https://www.youtube.com/playlist?list={match.group(1)}"
+
+    loop = asyncio.get_running_loop()
+
+    def extract():
+        options = {
+            **YDL_OPTIONS,
+            "noplaylist": False,
+            "extract_flat": "in_playlist",
+            "playlistend": MAX_PLAYLIST_TRACKS,
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    info = await loop.run_in_executor(None, extract)
+    entries = [entry for entry in (info or {}).get("entries") or [] if entry]
+
+    tracks = []
+    for entry in entries:
+        title = entry.get("title") or "Faixa"
+        if title.startswith("[") and (
+            "private" in title.lower() or "deleted" in title.lower()
+        ):
+            continue
+
+        link = entry.get("url") or entry.get("webpage_url")
+        if not link or not link.startswith("http"):
+            if is_youtube and entry.get("id"):
+                link = f"https://www.youtube.com/watch?v={entry['id']}"
+            else:
+                continue
+
+        tracks.append(
+            Track(
+                {
+                    "title": title,
+                    "webpage_url": link,
+                    "query": link,
+                    "duration": entry.get("duration"),
+                    "uploader": (
+                        entry.get("uploader") or entry.get("channel")
+                    ),
+                },
+                requester,
+            )
+        )
+
+    if not tracks:
+        raise ValueError("Nenhuma faixa encontrada nessa playlist.")
+
+    return tracks[:MAX_PLAYLIST_TRACKS], (info or {}).get("title")
+
+
+async def tracks_from_lines(lines, requester):
+    """Lê vários links/nomes (um por linha) e devolve as faixas."""
+    tracks = []
+    notes = []
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+
+        if line.startswith(("http://", "https://")):
+            if is_playlist_url(line):
+                try:
+                    found, _ = await expand_playlist(line, requester)
+                    tracks.extend(found)
+                except Exception as error:
+                    notes.append(
+                        f"{line[:50]}: "
+                        f"{(friendly_reason(error) or clean_error(error))[:100]}"
+                    )
+            else:
+                tracks.append(
+                    Track({"title": line[:80], "query": line}, requester)
+                )
+        else:
+            tracks.append(
+                Track({"title": line[:80], "query": line}, requester)
+            )
+
+        if len(tracks) >= MAX_QUEUE:
+            break
+
+    return tracks, notes
+
+
+def add_tracks(player, tracks):
+    """Coloca faixas na fila respeitando o limite. Retorna (ok, fora)."""
+    free = max(MAX_QUEUE - len(player.queue), 0)
+    accepted = tracks[:free]
+    player.queue.extend(accepted)
+    return len(accepted), len(tracks) - len(accepted)
+
+
+async def kick(player):
+    """Começa a tocar se estiver parado e atualiza o painel."""
+    await play_next(player)
+    await update_panel(player)
+
+
+async def add_playlist_link(interaction, player, link):
+    try:
+        tracks, title = await expand_playlist(link, interaction.user)
+    except Exception as error:
+        log.error(
+            "Falha ao carregar playlist %r: %s",
+            link,
+            clean_error(error),
+        )
+        reason = friendly_reason(error) or clean_error(error)[:250]
+        await interaction.followup.send(
+            f"Não consegui carregar a playlist: {reason}"
+        )
+        return
+
+    added, skipped = add_tracks(player, tracks)
+
+    message = f"📃 **{title or 'Playlist'}**: {added} faixas adicionadas à fila."
+    if skipped:
+        message += (
+            f" ({skipped} ficaram de fora: limite de {MAX_QUEUE} na fila.)"
+        )
+
+    await interaction.followup.send(message)
+    await kick(player)
+
+
+def track_query(track):
+    return track.query or track.url or track.title
+
+
+# ---------------------------------------------------------------
+# Playlists salvas pelo bot (SQLite)
+# ---------------------------------------------------------------
+
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS playlists ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "guild_id INTEGER NOT NULL, "
+        "name TEXT NOT NULL COLLATE NOCASE, "
+        "owner_id INTEGER NOT NULL, "
+        "UNIQUE(guild_id, name))"
+    )
+    con.execute(
+        "CREATE TABLE IF NOT EXISTS playlist_items ("
+        "playlist_id INTEGER NOT NULL, "
+        "position INTEGER NOT NULL, "
+        "title TEXT, "
+        "query TEXT NOT NULL)"
+    )
+    return con
+
+
+def add_to_playlist(guild_id, name, owner_id, items):
+    """Cria a playlist (ou adiciona nela). Retorna (criada, total, novas)."""
+    con = db()
+    try:
+        row = con.execute(
+            "SELECT id FROM playlists WHERE guild_id=? AND name=?",
+            (guild_id, name),
+        ).fetchone()
+
+        created = row is None
+        if created:
+            cursor = con.execute(
+                "INSERT INTO playlists (guild_id, name, owner_id) "
+                "VALUES (?, ?, ?)",
+                (guild_id, name, owner_id),
+            )
+            playlist_id = cursor.lastrowid
+        else:
+            playlist_id = row[0]
+
+        last = con.execute(
+            "SELECT COALESCE(MAX(position), 0) FROM playlist_items "
+            "WHERE playlist_id=?",
+            (playlist_id,),
+        ).fetchone()[0]
+        count = con.execute(
+            "SELECT COUNT(*) FROM playlist_items WHERE playlist_id=?",
+            (playlist_id,),
+        ).fetchone()[0]
+
+        items = items[: max(MAX_SAVED_TRACKS - count, 0)]
+
+        for index, (title, query) in enumerate(items, 1):
+            con.execute(
+                "INSERT INTO playlist_items "
+                "(playlist_id, position, title, query) "
+                "VALUES (?, ?, ?, ?)",
+                (playlist_id, last + index, title, query),
+            )
+
+        con.commit()
+        return created, count + len(items), len(items)
+    finally:
+        con.close()
+
+
+def get_playlist(guild_id, name):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT id, name, owner_id FROM playlists "
+            "WHERE guild_id=? AND name=?",
+            (guild_id, name),
+        ).fetchone()
+    finally:
+        con.close()
+
+
+def get_items(playlist_id):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT title, query FROM playlist_items "
+            "WHERE playlist_id=? ORDER BY position",
+            (playlist_id,),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def list_playlists(guild_id):
+    con = db()
+    try:
+        return con.execute(
+            "SELECT p.name, COUNT(i.playlist_id), p.owner_id "
+            "FROM playlists p "
+            "LEFT JOIN playlist_items i ON i.playlist_id = p.id "
+            "WHERE p.guild_id=? GROUP BY p.id ORDER BY p.name",
+            (guild_id,),
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def remove_playlist_item(playlist_id, number):
+    """Remove a faixa de número `number` (1, 2, 3...). Retorna o título."""
+    con = db()
+    try:
+        rows = con.execute(
+            "SELECT rowid, title FROM playlist_items "
+            "WHERE playlist_id=? ORDER BY position",
+            (playlist_id,),
+        ).fetchall()
+
+        if not 1 <= number <= len(rows):
+            return None
+
+        con.execute(
+            "DELETE FROM playlist_items WHERE rowid=?",
+            (rows[number - 1][0],),
+        )
+        con.commit()
+        return rows[number - 1][1]
+    finally:
+        con.close()
+
+
+def delete_playlist(playlist_id):
+    con = db()
+    try:
+        con.execute(
+            "DELETE FROM playlist_items WHERE playlist_id=?",
+            (playlist_id,),
+        )
+        con.execute("DELETE FROM playlists WHERE id=?", (playlist_id,))
+        con.commit()
+    finally:
+        con.close()
+
+
+def can_manage(interaction, owner_id):
+    """Quem criou a playlist ou quem tem 'Gerenciar Servidor'."""
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return interaction.user.id == owner_id or bool(
+        perms and perms.manage_guild
+    )
+
+
+def saved_message(name, created, total, added):
+    action = "criada" if created else "atualizada"
+    if added == 0:
+        return (
+            f"Playlist **{name}** {action}, mas nenhuma faixa foi "
+            f"adicionada (limite de {MAX_SAVED_TRACKS} faixas)."
+        )
+    return (
+        f"✅ Playlist **{name}** {action}: +{added} faixas "
+        f"(total: {total})."
+    )
+
+
+# ---------------------------------------------------------------
+# Painel e reprodução
+# ---------------------------------------------------------------
+
 def make_embed(player):
     embed = discord.Embed(
         title="🐱 NEKO MUSIC",
@@ -369,11 +836,13 @@ def make_embed(player):
 
     if player.current:
         track = player.current
+        title = discord.utils.escape_markdown(track.title)
 
-        embed.description = (
-            f"🎵 **[{discord.utils.escape_markdown(track.title)}]"
-            f"({track.url})**"
-        )
+        if track.url:
+            embed.description = f"🎵 **[{title}]({track.url})**"
+        else:
+            embed.description = f"🎵 **{title}**"
+
         embed.add_field(
             name="🎤 Artista",
             value=track.artist[:100],
@@ -427,21 +896,45 @@ async def update_panel(player):
 
 async def play_next(player):
     async with player.lock:
-        if not player.voice or not player.voice.is_connected():
-            return
+        while True:
+            if not player.voice or not player.voice.is_connected():
+                return
 
-        if player.voice.is_playing() or player.voice.is_paused():
-            return
+            if player.voice.is_playing() or player.voice.is_paused():
+                return
 
-        if player.loop and player.current:
-            track = player.current
-        elif player.queue:
-            track = player.queue.popleft()
-            player.current = track
-        else:
-            player.current = None
-            await update_panel(player)
-            return
+            if player.loop and player.current:
+                track = player.current
+            elif player.queue:
+                track = player.queue.popleft()
+                player.current = track
+            else:
+                player.current = None
+                await update_panel(player)
+                return
+
+            try:
+                # Faixas de playlist são resolvidas só agora.
+                await track.ensure_stream()
+                break
+            except Exception as error:
+                log.error(
+                    "Não consegui carregar %r: %s",
+                    track.title,
+                    clean_error(error),
+                )
+                player.current = None
+
+                if player.channel:
+                    reason = (
+                        friendly_reason(error) or clean_error(error)
+                    )[:200]
+                    try:
+                        await player.channel.send(
+                            f"⚠️ Pulei **{track.title[:80]}**: {reason}"
+                        )
+                    except discord.HTTPException:
+                        pass
 
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(
@@ -483,6 +976,142 @@ async def connect_voice(interaction):
 
     player.channel = interaction.channel
     return player
+
+
+# ---------------------------------------------------------------
+# Janelas (modais) para vários links e para salvar playlists
+# ---------------------------------------------------------------
+
+class MultiAddModal(discord.ui.Modal, title="Adicionar várias músicas"):
+    linhas = discord.ui.TextInput(
+        label="Um link ou nome de música por linha",
+        style=discord.TextStyle.paragraph,
+        placeholder=(
+            "https://youtu.be/...\n"
+            "https://soundcloud.com/...\n"
+            "nome da música\n"
+            "(também aceita link de playlist)"
+        ),
+        max_length=4000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+
+        player = await connect_voice(interaction)
+        if not player:
+            return
+
+        tracks, notes = await tracks_from_lines(
+            str(self.linhas).splitlines(),
+            interaction.user,
+        )
+
+        if not tracks:
+            await interaction.followup.send(
+                "Não encontrei nenhum link ou nome válido.",
+                ephemeral=True,
+            )
+            return
+
+        added, skipped = add_tracks(player, tracks)
+
+        message = f"➕ {added} faixas adicionadas à fila."
+        if skipped:
+            message += f" ({skipped} ficaram de fora: fila cheia.)"
+        if notes:
+            message += "\n⚠️ " + "\n⚠️ ".join(notes[:5])
+
+        await interaction.followup.send(message[:1900], ephemeral=True)
+        await kick(player)
+
+
+class SaveQueueModal(discord.ui.Modal, title="Salvar fila como playlist"):
+    nome = discord.ui.TextInput(
+        label="Nome da playlist",
+        max_length=50,
+        required=True,
+    )
+
+    def __init__(self, player):
+        super().__init__()
+        self.player = player
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        tracks = (
+            [self.player.current] if self.player.current else []
+        ) + list(self.player.queue)
+
+        if not tracks:
+            await interaction.followup.send(
+                "Não há músicas para salvar.",
+                ephemeral=True,
+            )
+            return
+
+        items = [(t.title, track_query(t)) for t in tracks]
+        name = str(self.nome).strip()
+
+        created, total, added = add_to_playlist(
+            interaction.guild_id,
+            name,
+            interaction.user.id,
+            items,
+        )
+        await interaction.followup.send(
+            saved_message(name, created, total, added),
+            ephemeral=True,
+        )
+
+
+class CreateListModal(discord.ui.Modal, title="Criar / adicionar à playlist"):
+    linhas = discord.ui.TextInput(
+        label="Um link ou nome de música por linha",
+        style=discord.TextStyle.paragraph,
+        placeholder=(
+            "https://youtu.be/...\n"
+            "nome da música\n"
+            "(também aceita link de playlist)"
+        ),
+        max_length=4000,
+        required=True,
+    )
+
+    def __init__(self, nome):
+        super().__init__()
+        self.nome = nome
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        tracks, notes = await tracks_from_lines(
+            str(self.linhas).splitlines(),
+            interaction.user,
+        )
+
+        if not tracks:
+            await interaction.followup.send(
+                "Não encontrei nenhum link ou nome válido.",
+                ephemeral=True,
+            )
+            return
+
+        items = [(t.title, track_query(t)) for t in tracks]
+        created, total, added = add_to_playlist(
+            interaction.guild_id,
+            self.nome,
+            interaction.user.id,
+            items,
+        )
+
+        message = saved_message(self.nome, created, total, added)
+        if notes:
+            message += "\n⚠️ " + "\n⚠️ ".join(notes[:5])
+
+        await interaction.followup.send(message[:1900], ephemeral=True)
 
 
 class MusicPanel(discord.ui.View):
@@ -634,7 +1263,7 @@ class MusicPanel(discord.ui.View):
         style=discord.ButtonStyle.danger,
         row=1,
     )
-    async def stop(self, interaction, button):
+    async def stop_music(self, interaction, button):
         p = self.player
         p.queue.clear()
         p.loop = False
@@ -666,11 +1295,11 @@ class MusicPanel(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="📃 Playlist",
+        label="📃 Fila",
         style=discord.ButtonStyle.secondary,
         row=1,
     )
-    async def playlist(self, interaction, button):
+    async def show_queue(self, interaction, button):
         p = self.player
 
         if not p.queue:
@@ -687,6 +1316,41 @@ class MusicPanel(discord.ui.View):
         await interaction.response.send_message(
             message[:1900],
             ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="🗑 Limpar fila",
+        style=discord.ButtonStyle.danger,
+        row=2,
+    )
+    async def clear_queue(self, interaction, button):
+        p = self.player
+        removed = len(p.queue)
+        p.queue.clear()
+
+        await interaction.response.send_message(
+            f"Fila limpa ({removed} faixas removidas). "
+            "A música atual continua tocando.",
+            ephemeral=True,
+        )
+        await update_panel(p)
+
+    @discord.ui.button(
+        label="➕ Adicionar várias",
+        style=discord.ButtonStyle.success,
+        row=2,
+    )
+    async def add_many(self, interaction, button):
+        await interaction.response.send_modal(MultiAddModal())
+
+    @discord.ui.button(
+        label="💾 Salvar fila",
+        style=discord.ButtonStyle.secondary,
+        row=2,
+    )
+    async def save_queue(self, interaction, button):
+        await interaction.response.send_modal(
+            SaveQueueModal(self.player)
         )
 
 
@@ -711,6 +1375,11 @@ async def play(interaction: discord.Interaction, busca: str):
 
     player = await connect_voice(interaction)
     if not player:
+        return
+
+    # Link de playlist inteira: carrega todas as faixas.
+    if is_playlist_url(busca):
+        await add_playlist_link(interaction, player, busca)
         return
 
     try:
@@ -744,6 +1413,55 @@ async def play(interaction: discord.Interaction, busca: str):
             f"🎵 Preparando: **{track.title}**"
         )
         await play_next(player)
+
+
+@bot.tree.command(
+    name="playlist",
+    description="Adiciona uma playlist inteira por link.",
+)
+@app_commands.describe(
+    link="Link da playlist (YouTube, SoundCloud ou Spotify)"
+)
+async def playlist_link_command(
+    interaction: discord.Interaction,
+    link: str,
+):
+    await interaction.response.defer(thinking=True)
+
+    if not link.startswith(("http://", "https://")):
+        await interaction.followup.send(
+            "Envie o link completo da playlist (começando com https://)."
+        )
+        return
+
+    player = await connect_voice(interaction)
+    if not player:
+        return
+
+    await add_playlist_link(interaction, player, link)
+
+
+@bot.tree.command(
+    name="adicionar_varios",
+    description="Adiciona vários links ou nomes de uma vez.",
+)
+async def add_many_command(interaction: discord.Interaction):
+    await interaction.response.send_modal(MultiAddModal())
+
+
+@bot.tree.command(
+    name="limpar",
+    description="Limpa a fila (a música atual continua).",
+)
+async def clear_command(interaction: discord.Interaction):
+    p = get_player(interaction.guild_id)
+    removed = len(p.queue)
+    p.queue.clear()
+
+    await interaction.response.send_message(
+        f"Fila limpa ({removed} faixas removidas)."
+    )
+    await update_panel(p)
 
 
 @bot.tree.command(
@@ -905,6 +1623,297 @@ async def lyrics_command(
 
 
 # ---------------------------------------------------------------
+# Playlists criadas pelo bot: /lista ...
+# ---------------------------------------------------------------
+
+lista = app_commands.Group(
+    name="lista",
+    description="Playlists salvas do servidor.",
+    guild_only=True,
+)
+bot.tree.add_command(lista)
+
+
+async def playlist_name_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    rows = list_playlists(interaction.guild_id)
+    return [
+        app_commands.Choice(name=name, value=name)
+        for name, _, _ in rows
+        if current.lower() in name.lower()
+    ][:25]
+
+
+@lista.command(
+    name="criar",
+    description="Cria uma playlist ou adiciona faixas a uma existente.",
+)
+@app_commands.describe(nome="Nome da playlist")
+async def lista_create(
+    interaction: discord.Interaction,
+    nome: str,
+):
+    nome = nome.strip()[:50]
+    if not nome:
+        await interaction.response.send_message(
+            "Informe um nome para a playlist.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_modal(CreateListModal(nome))
+
+
+@lista_create.autocomplete("nome")
+async def lista_create_autocomplete(interaction, current):
+    return await playlist_name_autocomplete(interaction, current)
+
+
+@lista.command(
+    name="salvar_fila",
+    description="Salva a fila atual como playlist.",
+)
+@app_commands.describe(nome="Nome da playlist")
+async def lista_save_queue(
+    interaction: discord.Interaction,
+    nome: str,
+):
+    p = get_player(interaction.guild_id)
+    tracks = ([p.current] if p.current else []) + list(p.queue)
+
+    if not tracks:
+        await interaction.response.send_message(
+            "Não há músicas para salvar.",
+            ephemeral=True,
+        )
+        return
+
+    nome = nome.strip()[:50]
+    items = [(t.title, track_query(t)) for t in tracks]
+    created, total, added = add_to_playlist(
+        interaction.guild_id,
+        nome,
+        interaction.user.id,
+        items,
+    )
+
+    await interaction.response.send_message(
+        saved_message(nome, created, total, added),
+        ephemeral=True,
+    )
+
+
+@lista_save_queue.autocomplete("nome")
+async def lista_save_autocomplete(interaction, current):
+    return await playlist_name_autocomplete(interaction, current)
+
+
+@lista.command(
+    name="tocar",
+    description="Coloca uma playlist salva na fila.",
+)
+@app_commands.describe(
+    nome="Nome da playlist",
+    embaralhar="Embaralhar as faixas antes de adicionar",
+)
+async def lista_play(
+    interaction: discord.Interaction,
+    nome: str,
+    embaralhar: bool = False,
+):
+    await interaction.response.defer(thinking=True)
+
+    playlist = get_playlist(interaction.guild_id, nome)
+    if not playlist:
+        await interaction.followup.send(
+            f"Não encontrei a playlist **{nome}**. "
+            "Veja as existentes com `/lista ver`."
+        )
+        return
+
+    items = get_items(playlist[0])
+    if not items:
+        await interaction.followup.send("Essa playlist está vazia.")
+        return
+
+    player = await connect_voice(interaction)
+    if not player:
+        return
+
+    tracks = [
+        Track({"title": title, "query": query}, interaction.user)
+        for title, query in items
+    ]
+    if embaralhar:
+        random.shuffle(tracks)
+
+    added, skipped = add_tracks(player, tracks)
+
+    message = f"📃 **{playlist[1]}**: {added} faixas adicionadas à fila."
+    if skipped:
+        message += f" ({skipped} ficaram de fora: fila cheia.)"
+
+    await interaction.followup.send(message)
+    await kick(player)
+
+
+@lista_play.autocomplete("nome")
+async def lista_play_autocomplete(interaction, current):
+    return await playlist_name_autocomplete(interaction, current)
+
+
+@lista.command(
+    name="ver",
+    description="Mostra as playlists salvas ou as faixas de uma.",
+)
+@app_commands.describe(
+    nome="Nome da playlist (deixe vazio para listar todas)"
+)
+async def lista_view(
+    interaction: discord.Interaction,
+    nome: str = None,
+):
+    if not nome:
+        rows = list_playlists(interaction.guild_id)
+        if not rows:
+            await interaction.response.send_message(
+                "Nenhuma playlist salva. Crie com `/lista criar`.",
+                ephemeral=True,
+            )
+            return
+
+        text = "\n".join(
+            f"• **{name}** ({count} faixas)"
+            for name, count, _ in rows
+        )
+        await interaction.response.send_message(
+            text[:1900],
+            ephemeral=True,
+        )
+        return
+
+    playlist = get_playlist(interaction.guild_id, nome)
+    if not playlist:
+        await interaction.response.send_message(
+            f"Não encontrei a playlist **{nome}**.",
+            ephemeral=True,
+        )
+        return
+
+    items = get_items(playlist[0])
+    if not items:
+        await interaction.response.send_message(
+            "Essa playlist está vazia.",
+            ephemeral=True,
+        )
+        return
+
+    text = f"**{playlist[1]}** ({len(items)} faixas)\n" + "\n".join(
+        f"{i}. {(title or query)[:80]}"
+        for i, (title, query) in enumerate(items[:25], 1)
+    )
+    if len(items) > 25:
+        text += f"\n... e mais {len(items) - 25}."
+
+    await interaction.response.send_message(
+        text[:1900],
+        ephemeral=True,
+    )
+
+
+@lista_view.autocomplete("nome")
+async def lista_view_autocomplete(interaction, current):
+    return await playlist_name_autocomplete(interaction, current)
+
+
+@lista.command(
+    name="remover_faixa",
+    description="Remove uma faixa de uma playlist salva.",
+)
+@app_commands.describe(
+    nome="Nome da playlist",
+    numero="Número da faixa (veja em /lista ver)",
+)
+async def lista_remove_track(
+    interaction: discord.Interaction,
+    nome: str,
+    numero: int,
+):
+    playlist = get_playlist(interaction.guild_id, nome)
+    if not playlist:
+        await interaction.response.send_message(
+            f"Não encontrei a playlist **{nome}**.",
+            ephemeral=True,
+        )
+        return
+
+    if not can_manage(interaction, playlist[2]):
+        await interaction.response.send_message(
+            "Só quem criou a playlist (ou quem tem Gerenciar "
+            "Servidor) pode remover faixas.",
+            ephemeral=True,
+        )
+        return
+
+    removed = remove_playlist_item(playlist[0], numero)
+    if removed is None:
+        await interaction.response.send_message(
+            "Número de faixa inválido.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        f"🗑 Removida: **{(removed or 'faixa')[:80]}**",
+        ephemeral=True,
+    )
+
+
+@lista_remove_track.autocomplete("nome")
+async def lista_remove_track_autocomplete(interaction, current):
+    return await playlist_name_autocomplete(interaction, current)
+
+
+@lista.command(
+    name="apagar",
+    description="Apaga uma playlist salva inteira.",
+)
+@app_commands.describe(nome="Nome da playlist")
+async def lista_delete(
+    interaction: discord.Interaction,
+    nome: str,
+):
+    playlist = get_playlist(interaction.guild_id, nome)
+    if not playlist:
+        await interaction.response.send_message(
+            f"Não encontrei a playlist **{nome}**.",
+            ephemeral=True,
+        )
+        return
+
+    if not can_manage(interaction, playlist[2]):
+        await interaction.response.send_message(
+            "Só quem criou a playlist (ou quem tem Gerenciar "
+            "Servidor) pode apagá-la.",
+            ephemeral=True,
+        )
+        return
+
+    delete_playlist(playlist[0])
+    await interaction.response.send_message(
+        f"🗑 Playlist **{playlist[1]}** apagada.",
+        ephemeral=True,
+    )
+
+
+@lista_delete.autocomplete("nome")
+async def lista_delete_autocomplete(interaction, current):
+    return await playlist_name_autocomplete(interaction, current)
+
+
+# ---------------------------------------------------------------
 # Perfil do bot: avatar e banner (somente o dono do bot)
 # ---------------------------------------------------------------
 
@@ -979,14 +1988,22 @@ async def update_profile(interaction, field, value, success_message):
         )
     except discord.HTTPException as error:
         text = error.text or str(error)
+        log.error(
+            "Falha ao alterar %s (status %s, código %s): %s",
+            field,
+            error.status,
+            error.code,
+            text,
+        )
+
         if error.status == 429 or "too fast" in text.lower():
             message = (
                 "O Discord limitou as mudanças de perfil. "
-                "Aguarde um pouco e tente de novo."
+                "Aguarde um pouco e tente de novo.\n"
+                f"Resposta do Discord: {text[:200]}"
             )
         else:
             message = f"O Discord recusou a alteração: {text[:300]}"
-        log.error("Falha ao alterar %s: %s", field, text)
     else:
         message = success_message
 
@@ -1099,14 +2116,25 @@ async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🐱 Neko • Ajuda",
         description=(
-            "`/play busca` • Reproduz por nome ou link\n"
-            "`/painel` • Mostra o painel\n"
+            "**Música**\n"
+            "`/play busca` • Uma música por nome ou link\n"
+            "`/playlist link` • Playlist inteira por link\n"
+            "`/adicionar_varios` • Vários links/nomes de uma vez\n"
+            "`/painel` • Mostra o painel com botões\n"
             "`/fila` • Mostra a fila\n"
+            "`/limpar` • Limpa a fila\n"
             "`/pular` • Avança a faixa\n"
-            "`/parar` • Para e limpa a fila\n"
+            "`/parar` • Para e limpa tudo\n"
             "`/sair` • Desconecta do canal\n"
             "`/letra [musica]` • Pesquisa letras\n"
-            "\n**Somente o dono do bot:**\n"
+            "\n**Playlists salvas**\n"
+            "`/lista criar nome` • Cria ou adiciona faixas\n"
+            "`/lista salvar_fila nome` • Salva a fila atual\n"
+            "`/lista tocar nome` • Toca uma playlist salva\n"
+            "`/lista ver [nome]` • Lista playlists ou faixas\n"
+            "`/lista remover_faixa nome numero` • Tira uma faixa\n"
+            "`/lista apagar nome` • Apaga a playlist\n"
+            "\n**Somente o dono do bot**\n"
             "`/avatar_definir` • Define o avatar (foto/GIF)\n"
             "`/avatar_remover` • Remove o avatar\n"
             "`/banner_definir` • Define o banner (foto/GIF)\n"
