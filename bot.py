@@ -66,6 +66,10 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
+# Imagens aceitas nos comandos de avatar e banner.
+IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+
 
 class Track:
     def __init__(self, data, requester):
@@ -900,6 +904,193 @@ async def lyrics_command(
         )
 
 
+# ---------------------------------------------------------------
+# Perfil do bot: avatar e banner (somente o dono do bot)
+# ---------------------------------------------------------------
+
+async def owner_only(interaction):
+    """Libera o comando apenas para o dono do bot."""
+    if await bot.is_owner(interaction.user):
+        return True
+
+    await interaction.response.send_message(
+        "Apenas o dono do bot pode usar este comando.",
+        ephemeral=True,
+    )
+    return False
+
+
+async def get_image_bytes(arquivo, link):
+    """Lê a imagem/GIF enviada como anexo ou baixada de um link."""
+    if arquivo:
+        kind = (arquivo.content_type or "").split(";")[0].lower()
+        if kind not in IMAGE_TYPES:
+            raise ValueError("Envie uma imagem PNG, JPG, GIF ou WEBP.")
+        if arquivo.size > MAX_IMAGE_BYTES:
+            raise ValueError("A imagem passa de 10 MB.")
+        return await arquivo.read()
+
+    if link:
+        if not link.startswith(("http://", "https://")):
+            raise ValueError(
+                "O link precisa começar com http:// ou https://."
+            )
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                link,
+                timeout=aiohttp.ClientTimeout(total=15),
+                headers={"User-Agent": "Mozilla/5.0"},
+            ) as response:
+                if response.status != 200:
+                    raise ValueError(
+                        "Não consegui baixar a imagem desse link."
+                    )
+
+                kind = (
+                    response.headers.get("Content-Type", "")
+                    .split(";")[0]
+                    .lower()
+                )
+                if kind not in IMAGE_TYPES:
+                    raise ValueError(
+                        "O link não aponta direto para uma imagem "
+                        "PNG, JPG, GIF ou WEBP."
+                    )
+
+                data = await response.content.read(MAX_IMAGE_BYTES + 1)
+                if len(data) > MAX_IMAGE_BYTES:
+                    raise ValueError("A imagem passa de 10 MB.")
+                return data
+
+    raise ValueError(
+        "Envie uma imagem/GIF no campo `arquivo` ou informe um `link`."
+    )
+
+
+async def update_profile(interaction, field, value, success_message):
+    """Aplica a mudança no perfil do bot e responde ao dono."""
+    try:
+        await bot.user.edit(**{field: value})
+    except TypeError:
+        message = (
+            "Sua versão do discord.py não suporta essa alteração. "
+            "Atualize com: pip install -U discord.py"
+        )
+    except discord.HTTPException as error:
+        text = error.text or str(error)
+        if error.status == 429 or "too fast" in text.lower():
+            message = (
+                "O Discord limitou as mudanças de perfil. "
+                "Aguarde um pouco e tente de novo."
+            )
+        else:
+            message = f"O Discord recusou a alteração: {text[:300]}"
+        log.error("Falha ao alterar %s: %s", field, text)
+    else:
+        message = success_message
+
+    await interaction.followup.send(message, ephemeral=True)
+
+
+@bot.tree.command(
+    name="avatar_definir",
+    description="Define a foto/GIF de avatar do bot (só o dono).",
+)
+@app_commands.describe(
+    arquivo="Imagem ou GIF para o avatar",
+    link="Ou link direto para a imagem/GIF",
+)
+async def avatar_set_command(
+    interaction: discord.Interaction,
+    arquivo: discord.Attachment = None,
+    link: str = None,
+):
+    if not await owner_only(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        data = await get_image_bytes(arquivo, link)
+    except Exception as error:
+        await interaction.followup.send(str(error)[:300], ephemeral=True)
+        return
+
+    await update_profile(
+        interaction,
+        "avatar",
+        data,
+        "✅ Avatar atualizado.",
+    )
+
+
+@bot.tree.command(
+    name="avatar_remover",
+    description="Remove o avatar do bot (só o dono).",
+)
+async def avatar_remove_command(interaction: discord.Interaction):
+    if not await owner_only(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await update_profile(
+        interaction,
+        "avatar",
+        None,
+        "✅ Avatar removido.",
+    )
+
+
+@bot.tree.command(
+    name="banner_definir",
+    description="Define a foto/GIF do banner do perfil do bot (só o dono).",
+)
+@app_commands.describe(
+    arquivo="Imagem ou GIF para o banner",
+    link="Ou link direto para a imagem/GIF",
+)
+async def banner_set_command(
+    interaction: discord.Interaction,
+    arquivo: discord.Attachment = None,
+    link: str = None,
+):
+    if not await owner_only(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        data = await get_image_bytes(arquivo, link)
+    except Exception as error:
+        await interaction.followup.send(str(error)[:300], ephemeral=True)
+        return
+
+    await update_profile(
+        interaction,
+        "banner",
+        data,
+        "✅ Banner atualizado.",
+    )
+
+
+@bot.tree.command(
+    name="banner_remover",
+    description="Remove o banner do perfil do bot (só o dono).",
+)
+async def banner_remove_command(interaction: discord.Interaction):
+    if not await owner_only(interaction):
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await update_profile(
+        interaction,
+        "banner",
+        None,
+        "✅ Banner removido.",
+    )
+
+
 @bot.tree.command(
     name="ajuda",
     description="Mostra os comandos do Neko.",
@@ -915,6 +1106,11 @@ async def help_command(interaction: discord.Interaction):
             "`/parar` • Para e limpa a fila\n"
             "`/sair` • Desconecta do canal\n"
             "`/letra [musica]` • Pesquisa letras\n"
+            "\n**Somente o dono do bot:**\n"
+            "`/avatar_definir` • Define o avatar (foto/GIF)\n"
+            "`/avatar_remover` • Remove o avatar\n"
+            "`/banner_definir` • Define o banner (foto/GIF)\n"
+            "`/banner_remover` • Remove o banner\n"
         ),
         color=discord.Color.from_rgb(119, 86, 255),
     )
