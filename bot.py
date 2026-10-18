@@ -55,15 +55,20 @@ YDL_OPTIONS = {
     "default_search": "ytsearch",
     "socket_timeout": 15,
     "retries": 3,
+    # Troca o "cliente" usado no YouTube. Pode ajudar contra o erro
+    # "Sign in to confirm you're not a bot" sem precisar de conta.
+    "extractor_args": {
+        "youtube": {"player_client": ["tv", "web_safari"]},
+    },
 }
 
 # Cookies via variável de ambiente (ideal para Secrets do GitHub,
 # Codespaces, Railway etc.): cole o conteúdo do cookies.txt em
-# YOUTUBE_COOKIES e o bot cria o arquivo ao iniciar.
+# YOUTUBE_COOKIES e o bot recria o arquivo a cada inicialização.
 COOKIES_ENV = os.getenv("YOUTUBE_COOKIES")
-if COOKIES_ENV and not os.path.isfile(COOKIES_FILE):
+if COOKIES_ENV:
     with open(COOKIES_FILE, "w", encoding="utf-8") as cookie_file:
-        cookie_file.write(COOKIES_ENV)
+        cookie_file.write(COOKIES_ENV.strip() + "\n")
 
 if os.path.isfile(COOKIES_FILE):
     YDL_OPTIONS["cookiefile"] = COOKIES_FILE
@@ -203,6 +208,14 @@ async def extract_info(query):
     return await loop.run_in_executor(None, extract)
 
 
+def simplify_query(text):
+    """Versão mais simples da busca: sem feat., parênteses e símbolos."""
+    text = re.sub(r"[\(\[].*?[\)\]]", " ", text)
+    text = re.sub(r"\b(feat|ft|featuring)\b\.?.*", " ", text, flags=re.I)
+    text = re.sub(r"[^\w\s'-]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
 async def search_text(text, skip_youtube=False):
     """Busca por texto: tenta YouTube e, se falhar, SoundCloud."""
     yt_error = None
@@ -217,17 +230,38 @@ async def search_text(text, skip_youtube=False):
                 clean_error(error),
             )
 
-    try:
-        return await extract_info(f"scsearch1:{text}")
-    except Exception as sc_error:
-        log.error(
-            "Busca no SoundCloud falhou: %s",
-            clean_error(sc_error),
-        )
-        # Mantém o erro do YouTube, que explica melhor o motivo.
-        if yt_error:
-            raise yt_error from sc_error
-        raise
+    # SoundCloud: primeiro a busca original, depois uma simplificada.
+    queries = [text]
+    simple = simplify_query(text)
+    if simple and simple.lower() != text.lower():
+        queries.append(simple)
+
+    sc_error = None
+    for query in queries:
+        try:
+            return await extract_info(f"scsearch1:{query}")
+        except Exception as error:
+            sc_error = error
+            log.warning(
+                "SoundCloud não achou %r: %s",
+                query,
+                clean_error(error),
+            )
+
+    blocked = skip_youtube or (
+        yt_error is not None
+        and "YouTube bloqueou" in (friendly_reason(yt_error) or "")
+    )
+
+    if blocked:
+        raise ValueError(
+            "Não achei essa música no SoundCloud e o YouTube "
+            "bloqueou o servidor do bot (pede login/cookies)."
+        ) from sc_error
+
+    if yt_error:
+        raise yt_error from sc_error
+    raise sc_error
 
 
 def clean_error(error):
@@ -239,6 +273,10 @@ def clean_error(error):
 def friendly_reason(error):
     """Traduz os erros mais comuns do yt-dlp para o usuário."""
     text = clean_error(error).lower()
+
+    # Mensagem que o próprio bot já montou.
+    if text.startswith("não achei"):
+        return clean_error(error)
 
     if "not a bot" in text or "sign in" in text:
         return (
@@ -429,7 +467,8 @@ async def resolve_track(query, requester):
                 clean_error(fallback_error),
             )
             raise ValueError(
-                reason
+                friendly_reason(fallback_error)
+                or reason
                 or (
                     "Não consegui reproduzir esse link. "
                     "Tente /play com o nome da música."
