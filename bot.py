@@ -1,4 +1,6 @@
 import os
+import re
+import html as html_module
 import asyncio
 import random
 import logging
@@ -17,6 +19,11 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 MAX_QUEUE = 100
 
+# Opcional: arquivo de cookies do YouTube (formato Netscape).
+# Só é usado se o arquivo existir. Útil quando o YouTube pede
+# "Sign in to confirm you're not a bot" (comum em VPS/servidores).
+COOKIES_FILE = os.getenv("YTDLP_COOKIES", "cookies.txt")
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("Neko")
 
@@ -29,8 +36,27 @@ YDL_OPTIONS = {
     "quiet": True,
     "no_warnings": True,
     "default_search": "ytsearch",
-    "source_address": "0.0.0.0",
+    "socket_timeout": 15,
+    "retries": 3,
 }
+
+# Cookies via variável de ambiente (ideal para Secrets do GitHub,
+# Codespaces, Railway etc.): cole o conteúdo do cookies.txt em
+# YOUTUBE_COOKIES e o bot cria o arquivo ao iniciar.
+COOKIES_ENV = os.getenv("YOUTUBE_COOKIES")
+if COOKIES_ENV and not os.path.isfile(COOKIES_FILE):
+    with open(COOKIES_FILE, "w", encoding="utf-8") as cookie_file:
+        cookie_file.write(COOKIES_ENV)
+
+if os.path.isfile(COOKIES_FILE):
+    YDL_OPTIONS["cookiefile"] = COOKIES_FILE
+    log.info("Usando cookies de %s", COOKIES_FILE)
+
+# Opcional: proxy residencial/HTTP para contornar bloqueio de IP.
+PROXY = os.getenv("YTDLP_PROXY")
+if PROXY:
+    YDL_OPTIONS["proxy"] = PROXY
+    log.info("Usando proxy para o yt-dlp.")
 
 FFMPEG_OPTIONS = {
     "before_options": (
@@ -100,7 +126,7 @@ async def extract_info(query):
         with yt_dlp.YoutubeDL(YDL_OPTIONS) as ydl:
             info = ydl.extract_info(query, download=False)
 
-            if "entries" in info:
+            if info and "entries" in info:
                 info = next(
                     (item for item in info["entries"] if item),
                     None,
@@ -114,19 +140,101 @@ async def extract_info(query):
     return await loop.run_in_executor(None, extract)
 
 
+async def search_text(text):
+    """Busca por texto: tenta YouTube e, se falhar, SoundCloud."""
+    try:
+        return await extract_info(f"ytsearch1:{text}")
+    except Exception as yt_error:
+        log.warning(
+            "Busca no YouTube falhou (%s). Tentando SoundCloud...",
+            clean_error(yt_error),
+        )
+        try:
+            return await extract_info(f"scsearch1:{text}")
+        except Exception as sc_error:
+            log.error(
+                "Busca no SoundCloud também falhou: %s",
+                clean_error(sc_error),
+            )
+            # Mantém o erro do YouTube, que explica melhor o motivo.
+            raise yt_error from sc_error
+
+
+def clean_error(error):
+    """Remove códigos de cor e deixa a mensagem do yt-dlp legível."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", str(error))
+    return text.replace("ERROR: ", "").strip()
+
+
+def friendly_reason(error):
+    """Traduz os erros mais comuns do yt-dlp para o usuário."""
+    text = clean_error(error).lower()
+
+    if "not a bot" in text or "sign in" in text:
+        return (
+            "O YouTube bloqueou o servidor do bot "
+            "(pede login/cookies)."
+        )
+    if "javascript runtime" in text or "deno" in text:
+        return (
+            "Falta o Deno (runtime JavaScript) para o yt-dlp "
+            "acessar o YouTube."
+        )
+    if "requested format is not available" in text:
+        return "Nenhum formato de áudio disponível (yt-dlp desatualizado?)."
+    if "private" in text or "unavailable" in text:
+        return "O vídeo está privado ou indisponível."
+    return None
+
+
+def clean_spotify_title(title):
+    """Converte o og:title do Spotify em algo bom para buscar."""
+    title = re.sub(r"\s*\|\s*Spotify\s*$", "", title, flags=re.I)
+    title = re.sub(
+        r"\s*-\s*(song|single|album|ep)"
+        r"( and lyrics)?\s*(by|from)\s*",
+        " ",
+        title,
+        flags=re.I,
+    )
+    return re.sub(r"\s+", " ", title).strip()
+
+
 async def resolve_track(query, requester):
+    is_link = query.startswith(("http://", "https://"))
+
+    # Busca por texto: YouTube primeiro, SoundCloud como reserva.
+    if not is_link:
+        try:
+            info = await search_text(query)
+            return Track(info, requester)
+        except Exception as search_error:
+            log.error(
+                "Busca por texto falhou para %r: %s",
+                query,
+                clean_error(search_error),
+            )
+            raise ValueError(
+                friendly_reason(search_error)
+                or "Não encontrei uma versão reproduzível dessa música."
+            ) from search_error
+
     # Links compatíveis são tentados diretamente.
     try:
         info = await extract_info(query)
         return Track(info, requester)
     except Exception as original_error:
-        # Se for um link de outra plataforma, tenta identificar
-        # o título da página e procurar uma versão reproduzível.
-        if not query.startswith(("http://", "https://")):
-            raise ValueError(
-                "Não encontrei uma versão reproduzível dessa música."
-            ) from original_error
+        log.error(
+            "yt-dlp falhou para %r: %s",
+            query,
+            clean_error(original_error),
+        )
 
+        reason = friendly_reason(original_error)
+
+        # Se for um link de outra plataforma (ex.: Spotify), tenta
+        # identificar o título da página e procurar uma versão
+        # reproduzível no YouTube.
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -136,15 +244,12 @@ async def resolve_track(query, requester):
                 ) as response:
                     if response.status >= 400:
                         raise ValueError("Não foi possível abrir o link.")
-                    html = await response.text(errors="ignore")
-
-            import re
-            import html as html_module
+                    page = await response.text(errors="ignore")
 
             match = re.search(
                 r'<meta[^>]+property=["\']og:title["\']'
                 r'[^>]+content=["\']([^"\']+)',
-                html,
+                page,
                 re.I,
             )
 
@@ -152,7 +257,7 @@ async def resolve_track(query, requester):
                 match = re.search(
                     r'<meta[^>]+content=["\']([^"\']+)'
                     r'["\'][^>]+property=["\']og:title["\']',
-                    html,
+                    page,
                     re.I,
                 )
 
@@ -160,13 +265,40 @@ async def resolve_track(query, requester):
                 raise ValueError("Não consegui identificar a música.")
 
             title = html_module.unescape(match.group(1))
-            info = await extract_info(f"ytsearch1:{title}")
+
+            if "spotify.com" in query:
+                title = clean_spotify_title(title)
+
+            # Tenta incluir o artista (og:description do Spotify
+            # costuma começar com "Artista · Música · ...").
+            desc = re.search(
+                r'<meta[^>]+property=["\']og:description["\']'
+                r'[^>]+content=["\']([^"\']+)',
+                page,
+                re.I,
+            )
+            if desc and "spotify.com" in query:
+                artist = html_module.unescape(desc.group(1))
+                artist = artist.split("·")[0].strip()
+                if artist and artist.lower() not in title.lower():
+                    title = f"{artist} {title}"
+
+            log.info("Fallback: buscando %r", title)
+            info = await search_text(title)
             return Track(info, requester)
 
         except Exception as fallback_error:
+            log.error(
+                "Fallback falhou para %r: %s",
+                query,
+                clean_error(fallback_error),
+            )
             raise ValueError(
-                "Não consegui reproduzir esse link. "
-                "Tente /play com o nome da música."
+                reason
+                or (
+                    "Não consegui reproduzir esse link. "
+                    "Tente /play com o nome da música."
+                )
             ) from fallback_error
 
 
@@ -505,6 +637,7 @@ async def on_ready():
         synced = await bot.tree.sync()
         log.info("Neko conectado: %s", bot.user)
         log.info("%s comandos sincronizados.", len(synced))
+        log.info("yt-dlp versão: %s", yt_dlp.version.__version__)
     except Exception:
         log.exception("Erro ao sincronizar comandos.")
 
