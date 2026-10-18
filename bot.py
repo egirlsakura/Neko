@@ -26,6 +26,7 @@ MAX_PLAYLIST_TRACKS = 100   # máximo carregado de uma playlist por link
 MAX_SAVED_TRACKS = 200      # máximo de faixas em uma playlist salva
 MAX_BLOCKS = 10             # máximo de playlists no rodízio
 MAX_CONSECUTIVE_FAILURES = 10  # para de tentar após tantas falhas seguidas
+SOUNDCLOUD_TRIES = 4        # quantos resultados do SoundCloud testar
 
 # Banco das playlists criadas pelo bot (SQLite, arquivo local).
 DB_PATH = os.getenv("PLAYLIST_DB", "playlists.db")
@@ -55,11 +56,6 @@ YDL_OPTIONS = {
     "default_search": "ytsearch",
     "socket_timeout": 15,
     "retries": 3,
-    # Troca o "cliente" usado no YouTube. Pode ajudar contra o erro
-    # "Sign in to confirm you're not a bot" sem precisar de conta.
-    "extractor_args": {
-        "youtube": {"player_client": ["tv", "web_safari"]},
-    },
 }
 
 # Cookies via variável de ambiente (ideal para Secrets do GitHub,
@@ -208,6 +204,58 @@ async def extract_info(query):
     return await loop.run_in_executor(None, extract)
 
 
+async def extract_flat_entries(query, limit):
+    """Lista os resultados de uma busca sem abrir cada um."""
+    loop = asyncio.get_running_loop()
+
+    def extract():
+        options = {
+            **YDL_OPTIONS,
+            "extract_flat": True,
+            "playlistend": limit,
+        }
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(query, download=False)
+        return [
+            entry
+            for entry in (info or {}).get("entries") or []
+            if entry
+        ]
+
+    return await loop.run_in_executor(None, extract)
+
+
+async def search_soundcloud(text):
+    """Procura no SoundCloud e usa o primeiro resultado que tocar.
+
+    Alguns resultados são protegidos (DRM) ou indisponíveis; nesses
+    casos o bot passa para o próximo em vez de desistir.
+    """
+    entries = await extract_flat_entries(
+        f"scsearch{SOUNDCLOUD_TRIES}:{text}",
+        SOUNDCLOUD_TRIES,
+    )
+
+    last_error = None
+    for entry in entries:
+        link = entry.get("url") or entry.get("webpage_url")
+        if not link:
+            continue
+
+        try:
+            return await extract_info(link)
+        except Exception as error:
+            last_error = error
+            log.warning(
+                "SoundCloud: pulei um resultado (%s)",
+                clean_error(error)[:120],
+            )
+
+    if last_error:
+        raise last_error
+    raise ValueError("Nenhum áudio reproduzível encontrado.")
+
+
 def simplify_query(text):
     """Versão mais simples da busca: sem feat., parênteses e símbolos."""
     text = re.sub(r"[\(\[].*?[\)\]]", " ", text)
@@ -239,7 +287,7 @@ async def search_text(text, skip_youtube=False):
     sc_error = None
     for query in queries:
         try:
-            return await extract_info(f"scsearch1:{query}")
+            return await search_soundcloud(query)
         except Exception as error:
             sc_error = error
             log.warning(
