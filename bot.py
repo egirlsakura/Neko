@@ -1,6 +1,8 @@
 import os
 import re
+import json
 import time
+import base64
 import sqlite3
 import html as html_module
 import asyncio
@@ -26,8 +28,9 @@ MAX_SAVED_TRACKS = 200      # máximo de faixas em uma playlist salva
 # Banco das playlists criadas pelo bot (SQLite, arquivo local).
 DB_PATH = os.getenv("PLAYLIST_DB", "playlists.db")
 
-# Opcional: necessário só para playlists/álbuns do Spotify.
-# Crie um app em https://developer.spotify.com/dashboard
+# Opcional: usado só para ÁLBUNS do Spotify (pela API oficial).
+# Playlists do Spotify são lidas pela página pública e não precisam
+# destas credenciais.
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
 
@@ -414,6 +417,7 @@ _spotify_token = {"value": None, "expires": 0}
 
 
 async def spotify_token():
+    """Token da API oficial do Spotify (usado só para álbuns)."""
     now = time.time()
     if (
         _spotify_token["value"]
@@ -421,14 +425,15 @@ async def spotify_token():
     ):
         return _spotify_token["value"]
 
+    credentials = base64.b64encode(
+        f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode()
+    ).decode()
+
     async with aiohttp.ClientSession() as session:
         async with session.post(
             "https://accounts.spotify.com/api/token",
             data={"grant_type": "client_credentials"},
-            auth=aiohttp.BasicAuth(
-                SPOTIFY_CLIENT_ID,
-                SPOTIFY_CLIENT_SECRET,
-            ),
+            headers={"Authorization": f"Basic {credentials}"},
             timeout=aiohttp.ClientTimeout(total=15),
         ) as response:
             if response.status != 200:
@@ -443,14 +448,83 @@ async def spotify_token():
     return _spotify_token["value"]
 
 
-async def expand_spotify(url, requester):
-    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
-        raise ValueError(
-            "Para playlists e álbuns do Spotify, configure "
-            "SPOTIFY_CLIENT_ID e SPOTIFY_CLIENT_SECRET nas variáveis "
-            "do bot (https://developer.spotify.com/dashboard)."
+def find_list_by_key(node, key):
+    """Procura, em qualquer nível de um JSON, uma lista com esse nome."""
+    if isinstance(node, dict):
+        value = node.get(key)
+        if isinstance(value, list):
+            return value
+        for child in node.values():
+            found = find_list_by_key(child, key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for child in node:
+            found = find_list_by_key(child, key)
+            if found is not None:
+                return found
+    return None
+
+
+async def spotify_public_playlist(spotify_id, requester):
+    """Lê as faixas de uma playlist PÚBLICA pela página de incorporação.
+
+    Não usa a API oficial (que, desde fevereiro de 2026, só entrega
+    playlists do próprio usuário logado). É um método não oficial e
+    pode parar de funcionar se o Spotify mudar a página.
+    """
+    url = f"https://open.spotify.com/embed/playlist/{spotify_id}"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            url,
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={"User-Agent": "Mozilla/5.0"},
+        ) as response:
+            if response.status != 200:
+                raise ValueError(
+                    f"Página da playlist indisponível ({response.status})."
+                )
+            page = await response.text(errors="ignore")
+
+    match = re.search(
+        r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+        page,
+        re.S,
+    )
+    if not match:
+        raise ValueError("Formato da página do Spotify não reconhecido.")
+
+    data = json.loads(match.group(1))
+    entries = find_list_by_key(data, "trackList")
+    if not entries:
+        raise ValueError("Nenhuma faixa encontrada na página.")
+
+    tracks = []
+    for entry in entries:
+        name = (entry.get("title") or "").strip()
+        if not name:
+            continue
+
+        artist = re.sub(r"\s+", " ", entry.get("subtitle") or "").strip()
+        text = f"{artist} {name}".strip()
+
+        tracks.append(
+            Track(
+                {
+                    "title": text,
+                    "query": text,
+                    "uploader": artist,
+                    "duration": int(entry.get("duration") or 0) // 1000,
+                },
+                requester,
+            )
         )
 
+    return tracks[:MAX_PLAYLIST_TRACKS]
+
+
+async def expand_spotify(url, requester):
     match = re.search(
         r"spotify\.com/(?:[\w-]+/)?(playlist|album)/([A-Za-z0-9]+)",
         url,
@@ -459,11 +533,35 @@ async def expand_spotify(url, requester):
         raise ValueError("Link do Spotify não reconhecido.")
 
     kind, spotify_id = match.groups()
+
+    # Playlists: página pública (a API oficial não serve para bots).
+    if kind == "playlist":
+        try:
+            tracks = await spotify_public_playlist(spotify_id, requester)
+        except Exception as error:
+            log.error(
+                "Leitura da playlist do Spotify falhou: %s",
+                clean_error(error),
+            )
+            raise ValueError(
+                "Não consegui ler essa playlist do Spotify. Ela precisa "
+                "ser pública. Como alternativa, copie os links das "
+                "faixas e use /adicionar_varios."
+            ) from error
+
+        if not tracks:
+            raise ValueError("Nenhuma faixa encontrada nessa playlist.")
+        return tracks, "Playlist do Spotify"
+
+    # Álbuns: API oficial (precisa de Client ID e Client Secret).
+    if not (SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET):
+        raise ValueError(
+            "Para álbuns do Spotify, configure SPOTIFY_CLIENT_ID e "
+            "SPOTIFY_CLIENT_SECRET nas variáveis do bot."
+        )
+
     headers = {"Authorization": f"Bearer {await spotify_token()}"}
-    api = (
-        f"https://api.spotify.com/v1/{kind}s/{spotify_id}/tracks"
-        "?limit=50"
-    )
+    api = f"https://api.spotify.com/v1/albums/{spotify_id}/tracks?limit=50"
 
     tracks = []
 
@@ -474,25 +572,25 @@ async def expand_spotify(url, requester):
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
             ) as response:
-                if response.status in (403, 404):
-                    raise ValueError(
-                        "O Spotify não liberou essa playlist "
-                        "(pode ser privada ou restrita)."
-                    )
                 if response.status != 200:
+                    body = (await response.text())[:200]
+                    log.error(
+                        "Spotify álbum falhou (%s): %s",
+                        response.status,
+                        body,
+                    )
                     raise ValueError(
-                        f"Erro ao consultar o Spotify "
+                        f"O Spotify não liberou esse álbum "
                         f"({response.status})."
                     )
                 data = await response.json()
 
             for item in data.get("items", []):
-                track = item.get("track") if kind == "playlist" else item
-                if not track or not track.get("name"):
+                if not item or not item.get("name"):
                     continue
 
-                artist = (track.get("artists") or [{}])[0].get("name", "")
-                text = f"{artist} {track['name']}".strip()
+                artist = (item.get("artists") or [{}])[0].get("name", "")
+                text = f"{artist} {item['name']}".strip()
                 tracks.append(
                     Track(
                         {
@@ -500,7 +598,7 @@ async def expand_spotify(url, requester):
                             "query": text,
                             "uploader": artist,
                             "duration": (
-                                (track.get("duration_ms") or 0) // 1000
+                                (item.get("duration_ms") or 0) // 1000
                             ),
                         },
                         requester,
@@ -510,10 +608,9 @@ async def expand_spotify(url, requester):
             api = data.get("next")
 
     if not tracks:
-        raise ValueError("Nenhuma faixa encontrada nessa playlist.")
+        raise ValueError("Nenhuma faixa encontrada nesse álbum.")
 
-    label = "Playlist do Spotify" if kind == "playlist" else "Álbum do Spotify"
-    return tracks[:MAX_PLAYLIST_TRACKS], label
+    return tracks[:MAX_PLAYLIST_TRACKS], "Álbum do Spotify"
 
 
 async def expand_playlist(url, requester):
