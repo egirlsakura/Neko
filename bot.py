@@ -24,6 +24,8 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 MAX_QUEUE = 100             # máximo de faixas na fila
 MAX_PLAYLIST_TRACKS = 100   # máximo carregado de uma playlist por link
 MAX_SAVED_TRACKS = 200      # máximo de faixas em uma playlist salva
+MAX_BLOCKS = 10             # máximo de playlists no rodízio
+MAX_CONSECUTIVE_FAILURES = 10  # para de tentar após tantas falhas seguidas
 
 # Banco das playlists criadas pelo bot (SQLite, arquivo local).
 DB_PATH = os.getenv("PLAYLIST_DB", "playlists.db")
@@ -112,6 +114,8 @@ class Track:
         )
         self.thumbnail = data.get("thumbnail")
         self.requester = requester
+        # Preenchido quando a faixa vem do rodízio de playlists.
+        self.block_id = data.get("block_id")
 
     async def ensure_stream(self):
         if self.stream:
@@ -126,6 +130,18 @@ class Track:
         self.thumbnail = resolved.thumbnail
 
 
+class PlaylistBlock:
+    """Uma playlist do rodízio (adicionada com /playduspika)."""
+
+    def __init__(self, block_id, link, title, requester, items):
+        self.id = block_id
+        self.link = link
+        self.title = title or "Playlist"
+        self.requester = requester
+        # Lista de dicts: title, query, uploader, duration.
+        self.items = items
+
+
 class MusicPlayer:
     def __init__(self):
         self.queue = deque()
@@ -138,6 +154,13 @@ class MusicPlayer:
         self.shuffle = False
         self.autoplay = False
         self.lock = asyncio.Lock()
+
+        # Rodízio de playlists (separado da fila normal).
+        self.blocks = []
+        self.block_index = 0
+        self.block_pos = 0
+        self.block_counter = 0
+        self.rotation_loop = True
 
 
 players = {}
@@ -260,6 +283,11 @@ PLAYLIST_URL_RE = re.compile(
 
 def is_playlist_url(url):
     return bool(PLAYLIST_URL_RE.search(url))
+
+
+def looks_like_playlist(url):
+    """Link de playlist, ou link do YouTube que traz ?list=."""
+    return is_playlist_url(url) or bool(re.search(r"[?&]list=", url))
 
 
 async def youtube_oembed_title(url):
@@ -757,6 +785,139 @@ def track_query(track):
 
 
 # ---------------------------------------------------------------
+# Rodízio de playlists (uma playlist depois da outra)
+# ---------------------------------------------------------------
+
+def tracks_to_items(tracks):
+    """Guarda só os dados da faixa; o áudio é buscado na hora de tocar."""
+    return [
+        {
+            "title": track.title,
+            "query": track.query,
+            "uploader": track.artist,
+            "duration": track.duration,
+        }
+        for track in tracks
+    ]
+
+
+def add_block(player, link, title, requester, tracks):
+    player.block_counter += 1
+    block = PlaylistBlock(
+        player.block_counter,
+        link,
+        title,
+        requester,
+        tracks_to_items(tracks),
+    )
+    player.blocks.append(block)
+    return block
+
+
+def remove_block(player, block_id):
+    """Remove uma playlist do rodízio, ajustando a posição atual."""
+    for index, block in enumerate(player.blocks):
+        if block.id == block_id:
+            del player.blocks[index]
+
+            if index < player.block_index:
+                player.block_index -= 1
+            elif index == player.block_index:
+                player.block_pos = 0
+
+            return block
+    return None
+
+
+def clear_rotation(player):
+    player.blocks.clear()
+    player.block_index = 0
+    player.block_pos = 0
+
+
+def next_rotation_track(player):
+    """Próxima faixa do rodízio, ou None se não houver mais."""
+    if not player.blocks:
+        return None
+
+    wrapped = False
+
+    while True:
+        if player.block_index >= len(player.blocks):
+            if not player.rotation_loop or wrapped:
+                return None
+            player.block_index = 0
+            player.block_pos = 0
+            wrapped = True
+
+        block = player.blocks[player.block_index]
+
+        if player.block_pos < len(block.items):
+            data = dict(block.items[player.block_pos])
+            data["block_id"] = block.id
+            player.block_pos += 1
+            return Track(data, block.requester)
+
+        # Acabou esta playlist: passa para a próxima.
+        player.block_index += 1
+        player.block_pos = 0
+
+
+def can_edit_block(interaction, block):
+    """Quem adicionou a playlist ou quem tem 'Gerenciar Servidor'."""
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return block.requester.id == interaction.user.id or bool(
+        perms and perms.manage_guild
+    )
+
+
+def blocks_embed(player, selected=None):
+    embed = discord.Embed(
+        title="📋 Playlists do rodízio",
+        color=discord.Color.from_rgb(119, 86, 255),
+    )
+
+    if not player.blocks:
+        embed.description = (
+            "Nenhuma playlist no rodízio.\n"
+            "Adicione com `/playduspika`."
+        )
+    else:
+        playing_id = (
+            getattr(player.current, "block_id", None)
+            if player.current
+            else None
+        )
+
+        lines = []
+        for number, block in enumerate(player.blocks, 1):
+            marker = "👉 " if block.id == selected else ""
+            title = discord.utils.escape_markdown(block.title)[:60]
+            line = (
+                f"{marker}**{number}.** [{title}](<{block.link}>) "
+                f"— {len(block.items)} faixas • {block.requester.mention}"
+            )
+            if block.id == playing_id:
+                line += "\n      ▶ tocando agora"
+            lines.append(line)
+
+        embed.description = "\n".join(lines)[:4000]
+
+    embed.set_footer(
+        text=(
+            "Depois da última playlist: "
+            + (
+                "volta para a primeira"
+                if player.rotation_loop
+                else "para de tocar o rodízio"
+            )
+        )
+    )
+
+    return embed
+
+
+# ---------------------------------------------------------------
 # Playlists salvas pelo bot (SQLite)
 # ---------------------------------------------------------------
 
@@ -961,13 +1122,15 @@ def make_embed(player):
     else:
         embed.description = "Nenhuma música está tocando."
 
-    embed.set_footer(
-        text=(
-            f"Volume: {int(player.volume * 100)}% | "
-            f"Loop: {'Ligado' if player.loop else 'Desligado'} | "
-            f"Fila: {len(player.queue)}"
-        )
+    footer = (
+        f"Volume: {int(player.volume * 100)}% | "
+        f"Loop: {'Ligado' if player.loop else 'Desligado'} | "
+        f"Fila: {len(player.queue)}"
     )
+    if player.blocks:
+        footer += f" | Playlists: {len(player.blocks)}"
+
+    embed.set_footer(text=footer)
 
     return embed
 
@@ -993,6 +1156,8 @@ async def update_panel(player):
 
 async def play_next(player):
     async with player.lock:
+        failures = 0
+
         while True:
             if not player.voice or not player.voice.is_connected():
                 return
@@ -1006,9 +1171,13 @@ async def play_next(player):
                 track = player.queue.popleft()
                 player.current = track
             else:
-                player.current = None
-                await update_panel(player)
-                return
+                # Fila normal vazia: segue o rodízio de playlists.
+                track = next_rotation_track(player)
+                if track is None:
+                    player.current = None
+                    await update_panel(player)
+                    return
+                player.current = track
 
             try:
                 # Faixas de playlist são resolvidas só agora.
@@ -1021,6 +1190,7 @@ async def play_next(player):
                     clean_error(error),
                 )
                 player.current = None
+                failures += 1
 
                 if player.channel:
                     reason = (
@@ -1032,6 +1202,19 @@ async def play_next(player):
                         )
                     except discord.HTTPException:
                         pass
+
+                if failures >= MAX_CONSECUTIVE_FAILURES:
+                    if player.channel:
+                        try:
+                            await player.channel.send(
+                                "⚠️ Muitas faixas seguidas falharam, "
+                                "então parei por aqui. Tente de novo "
+                                "com /play."
+                            )
+                        except discord.HTTPException:
+                            pass
+                    await update_panel(player)
+                    return
 
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(
@@ -1076,7 +1259,7 @@ async def connect_voice(interaction):
 
 
 # ---------------------------------------------------------------
-# Janelas (modais) para vários links e para salvar playlists
+# Janelas (modais) para vários links, salvar e substituir playlists
 # ---------------------------------------------------------------
 
 class MultiAddModal(discord.ui.Modal, title="Adicionar várias músicas"):
@@ -1209,6 +1392,206 @@ class CreateListModal(discord.ui.Modal, title="Criar / adicionar à playlist"):
             message += "\n⚠️ " + "\n⚠️ ".join(notes[:5])
 
         await interaction.followup.send(message[:1900], ephemeral=True)
+
+
+class ReplaceModal(discord.ui.Modal, title="Substituir playlist"):
+    link = discord.ui.TextInput(
+        label="Link da nova playlist",
+        placeholder="https://...",
+        max_length=500,
+        required=True,
+    )
+
+    def __init__(self, player, block_id):
+        super().__init__()
+        self.player = player
+        self.block_id = block_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        block = next(
+            (b for b in self.player.blocks if b.id == self.block_id),
+            None,
+        )
+        if not block:
+            await interaction.followup.send(
+                "Essa playlist já foi removida do rodízio.",
+                ephemeral=True,
+            )
+            return
+
+        link = str(self.link).strip()
+        if not link.startswith(("http://", "https://")) or (
+            not looks_like_playlist(link)
+        ):
+            await interaction.followup.send(
+                "Esse link não parece ser de uma playlist.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            tracks, title = await expand_playlist(link, interaction.user)
+        except Exception as error:
+            log.error(
+                "Falha ao substituir playlist %r: %s",
+                link,
+                clean_error(error),
+            )
+            reason = friendly_reason(error) or clean_error(error)[:250]
+            await interaction.followup.send(
+                f"Não consegui carregar a nova playlist: {reason}",
+                ephemeral=True,
+            )
+            return
+
+        block.link = link
+        block.title = title or "Playlist"
+        block.items = tracks_to_items(tracks)
+        block.requester = interaction.user
+
+        # Se era a playlist da vez, a nova começa do início
+        # (a música atual termina normalmente).
+        if (
+            block in self.player.blocks
+            and self.player.blocks.index(block) == self.player.block_index
+        ):
+            self.player.block_pos = 0
+
+        try:
+            await interaction.edit_original_response(
+                embed=blocks_embed(self.player, block.id),
+                view=RotationView(self.player, block.id),
+            )
+        except discord.HTTPException:
+            pass
+
+        await interaction.followup.send(
+            f"🔄 Playlist substituída por **{block.title}** "
+            f"({len(block.items)} faixas).",
+            ephemeral=True,
+        )
+        await update_panel(self.player)
+
+
+class RotationView(discord.ui.View):
+    """Lista das playlists do rodízio, com remover/substituir."""
+
+    def __init__(self, player, selected=None):
+        super().__init__(timeout=300)
+        self.player = player
+        self.selected = selected
+
+        if player.blocks:
+            options = [
+                discord.SelectOption(
+                    label=f"{number}. {block.title}"[:100],
+                    value=str(block.id),
+                    default=(block.id == selected),
+                )
+                for number, block in enumerate(player.blocks, 1)
+            ]
+            select = discord.ui.Select(
+                placeholder="Escolha uma playlist...",
+                options=options,
+                row=0,
+            )
+            select.callback = self.on_select
+            self.add_item(select)
+
+    def get_block(self):
+        for block in self.player.blocks:
+            if block.id == self.selected:
+                return block
+        return None
+
+    async def on_select(self, interaction: discord.Interaction):
+        selected = int(interaction.data["values"][0])
+        await interaction.response.edit_message(
+            embed=blocks_embed(self.player, selected),
+            view=RotationView(self.player, selected),
+        )
+
+    @discord.ui.button(
+        label="🗑 Remover",
+        style=discord.ButtonStyle.danger,
+        row=1,
+    )
+    async def remove_selected(self, interaction, button):
+        block = self.get_block()
+        if not block:
+            await interaction.response.send_message(
+                "Escolha uma playlist na lista primeiro.",
+                ephemeral=True,
+            )
+            return
+
+        if not can_edit_block(interaction, block):
+            await interaction.response.send_message(
+                "Só quem adicionou a playlist (ou quem tem Gerenciar "
+                "Servidor) pode remover.",
+                ephemeral=True,
+            )
+            return
+
+        remove_block(self.player, block.id)
+
+        await interaction.response.edit_message(
+            embed=blocks_embed(self.player),
+            view=RotationView(self.player),
+        )
+        await update_panel(self.player)
+
+    @discord.ui.button(
+        label="🔄 Substituir",
+        style=discord.ButtonStyle.primary,
+        row=1,
+    )
+    async def replace_selected(self, interaction, button):
+        block = self.get_block()
+        if not block:
+            await interaction.response.send_message(
+                "Escolha uma playlist na lista primeiro.",
+                ephemeral=True,
+            )
+            return
+
+        if not can_edit_block(interaction, block):
+            await interaction.response.send_message(
+                "Só quem adicionou a playlist (ou quem tem Gerenciar "
+                "Servidor) pode substituir.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            ReplaceModal(self.player, block.id)
+        )
+
+    @discord.ui.button(
+        label="🔁 Rodízio",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
+    async def toggle_rotation(self, interaction, button):
+        self.player.rotation_loop = not self.player.rotation_loop
+
+        await interaction.response.edit_message(
+            embed=blocks_embed(self.player, self.selected),
+            view=RotationView(self.player, self.selected),
+        )
+
+    @discord.ui.button(
+        label="🔃 Atualizar",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
+    async def refresh_list(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=blocks_embed(self.player, self.selected),
+            view=RotationView(self.player, self.selected),
+        )
 
 
 class MusicPanel(discord.ui.View):
@@ -1363,6 +1746,7 @@ class MusicPanel(discord.ui.View):
     async def stop_music(self, interaction, button):
         p = self.player
         p.queue.clear()
+        clear_rotation(p)
         p.loop = False
         p.current = None
 
@@ -1370,7 +1754,7 @@ class MusicPanel(discord.ui.View):
             p.voice.stop()
 
         await interaction.response.send_message(
-            "Reprodução parada e fila limpa.",
+            "Reprodução parada, fila e rodízio limpos.",
             ephemeral=True,
         )
         await update_panel(p)
@@ -1427,7 +1811,7 @@ class MusicPanel(discord.ui.View):
 
         await interaction.response.send_message(
             f"Fila limpa ({removed} faixas removidas). "
-            "A música atual continua tocando.",
+            "A música atual e o rodízio de playlists continuam.",
             ephemeral=True,
         )
         await update_panel(p)
@@ -1448,6 +1832,18 @@ class MusicPanel(discord.ui.View):
     async def save_queue(self, interaction, button):
         await interaction.response.send_modal(
             SaveQueueModal(self.player)
+        )
+
+    @discord.ui.button(
+        label="📋 Playlists",
+        style=discord.ButtonStyle.primary,
+        row=2,
+    )
+    async def show_rotation(self, interaction, button):
+        await interaction.response.send_message(
+            embed=blocks_embed(self.player),
+            view=RotationView(self.player),
+            ephemeral=True,
         )
 
 
@@ -1539,6 +1935,86 @@ async def playlist_link_command(
 
 
 @bot.tree.command(
+    name="playduspika",
+    description="Adiciona uma playlist ao rodízio (uma toca depois da outra).",
+)
+@app_commands.describe(
+    link="Link da playlist (YouTube, SoundCloud ou Spotify)"
+)
+async def rotation_add_command(
+    interaction: discord.Interaction,
+    link: str,
+):
+    await interaction.response.defer(thinking=True)
+
+    link = link.strip()
+    if not link.startswith(("http://", "https://")):
+        await interaction.followup.send(
+            "Envie o link completo da playlist (começando com https://)."
+        )
+        return
+
+    if not looks_like_playlist(link):
+        await interaction.followup.send(
+            "Esse link não parece ser de uma playlist. "
+            "Para uma música só, use `/play`."
+        )
+        return
+
+    player = await connect_voice(interaction)
+    if not player:
+        return
+
+    if len(player.blocks) >= MAX_BLOCKS:
+        await interaction.followup.send(
+            f"O rodízio já tem {MAX_BLOCKS} playlists. Remova alguma "
+            "em `/playduspika_lista` para adicionar outra."
+        )
+        return
+
+    try:
+        tracks, title = await expand_playlist(link, interaction.user)
+    except Exception as error:
+        log.error(
+            "Falha ao carregar playlist do rodízio %r: %s",
+            link,
+            clean_error(error),
+        )
+        reason = friendly_reason(error) or clean_error(error)[:250]
+        await interaction.followup.send(
+            f"Não consegui carregar a playlist: {reason}"
+        )
+        return
+
+    block = add_block(player, link, title, interaction.user, tracks)
+    position = len(player.blocks)
+
+    message = (
+        f"📋 **{block.title}** entrou no rodízio como playlist nº "
+        f"{position} ({len(block.items)} faixas)."
+    )
+    if position > 1:
+        message += " Ela toca quando a anterior terminar."
+
+    await interaction.followup.send(message)
+    await kick(player)
+
+
+@bot.tree.command(
+    name="playduspika_lista",
+    description="Mostra as playlists do rodízio e permite remover/substituir.",
+)
+async def rotation_list_command(interaction: discord.Interaction):
+    player = get_player(interaction.guild_id)
+
+    await interaction.response.send_message(
+        embed=blocks_embed(player),
+        view=RotationView(player),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
     name="adicionar_varios",
     description="Adiciona vários links ou nomes de uma vez.",
 )
@@ -1548,7 +2024,7 @@ async def add_many_command(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="limpar",
-    description="Limpa a fila (a música atual continua).",
+    description="Limpa a fila (a música atual e o rodízio continuam).",
 )
 async def clear_command(interaction: discord.Interaction):
     p = get_player(interaction.guild_id)
@@ -1620,11 +2096,12 @@ async def skip_command(interaction: discord.Interaction):
 
 @bot.tree.command(
     name="parar",
-    description="Para a música e limpa a fila.",
+    description="Para a música e limpa a fila e o rodízio.",
 )
 async def stop_command(interaction: discord.Interaction):
     p = get_player(interaction.guild_id)
     p.queue.clear()
+    clear_rotation(p)
     p.current = None
     p.loop = False
 
@@ -1632,7 +2109,7 @@ async def stop_command(interaction: discord.Interaction):
         p.voice.stop()
 
     await interaction.response.send_message(
-        "Reprodução parada e fila limpa."
+        "Reprodução parada, fila e rodízio limpos."
     )
     await update_panel(p)
 
@@ -1650,6 +2127,7 @@ async def leave_command(interaction: discord.Interaction):
     p.voice = None
     p.current = None
     p.queue.clear()
+    clear_rotation(p)
 
     await interaction.response.send_message(
         "Neko saiu do canal de voz."
@@ -2221,9 +2699,12 @@ async def help_command(interaction: discord.Interaction):
             "`/fila` • Mostra a fila\n"
             "`/limpar` • Limpa a fila\n"
             "`/pular` • Avança a faixa\n"
-            "`/parar` • Para e limpa tudo\n"
+            "`/parar` • Para e limpa fila e rodízio\n"
             "`/sair` • Desconecta do canal\n"
             "`/letra [musica]` • Pesquisa letras\n"
+            "\n**Rodízio de playlists**\n"
+            "`/playduspika link` • Entra na sequência de playlists\n"
+            "`/playduspika_lista` • Vê, remove ou substitui playlists\n"
             "\n**Playlists salvas**\n"
             "`/lista criar nome` • Cria ou adiciona faixas\n"
             "`/lista salvar_fila nome` • Salva a fila atual\n"
