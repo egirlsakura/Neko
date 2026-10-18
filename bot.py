@@ -2553,36 +2553,53 @@ async def get_image_bytes(arquivo, link):
 
 
 async def update_profile(interaction, field, value, success_message):
-    """Aplica a mudança no perfil do bot e responde ao dono."""
+    """Atualiza avatar/banner e trata limites do Discord."""
+    if bot.user is None:
+        await interaction.followup.send(
+            "O Neko ainda não está conectado ao Discord.",
+            ephemeral=True,
+        )
+        return
+
     try:
         await bot.user.edit(**{field: value})
+
     except TypeError:
-        message = (
-            "Sua versão do discord.py não suporta essa alteração. "
-            "Atualize com: pip install -U discord.py"
+        await interaction.followup.send(
+            "A versão do discord.py pode estar desatualizada. "
+            "Atualize com: pip install -U discord.py e reinicie o Neko.",
+            ephemeral=True,
         )
+
     except discord.HTTPException as error:
-        text = error.text or str(error)
+        resposta = error.text or str(error)
         log.error(
-            "Falha ao alterar %s (status %s, código %s): %s",
+            "Falha ao alterar %s: status=%s, código=%s, resposta=%s",
             field,
             error.status,
             error.code,
-            text,
+            resposta,
         )
 
-        if error.status == 429 or "too fast" in text.lower():
-            message = (
-                "O Discord limitou as mudanças de perfil. "
-                "Aguarde um pouco e tente de novo.\n"
-                f"Resposta do Discord: {text[:200]}"
+        if error.status == 429 or "too fast" in resposta.lower():
+            mensagem = (
+                f"O Discord limitou a alteração de {field}. "
+                "Não tente novamente repetidamente. Aguarde o limite "
+                "ser liberado e tente uma vez."
             )
         else:
-            message = f"O Discord recusou a alteração: {text[:300]}"
-    else:
-        message = success_message
+            mensagem = (
+                f"O Discord recusou a alteração de {field}: "
+                f"{resposta[:250]}"
+            )
 
-    await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(mensagem, ephemeral=True)
+
+    else:
+        await interaction.followup.send(
+            success_message,
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(
