@@ -18,6 +18,12 @@ from discord.ext import commands
 import yt_dlp
 from dotenv import load_dotenv
 
+try:
+    # Já vem instalado junto com o yt-dlp; usado só para ler a duração.
+    from mutagen import File as MutagenFile
+except ImportError:
+    MutagenFile = None
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -30,6 +36,17 @@ SOUNDCLOUD_TRIES = 4        # quantos resultados do SoundCloud testar
 
 # Banco das playlists criadas pelo bot (SQLite, arquivo local).
 DB_PATH = os.getenv("PLAYLIST_DB", "playlists.db")
+
+# Pasta dos arquivos de música (enviados com /musica_adicionar).
+# Por padrão usa /data/musicas quando a pasta /data existe (costuma
+# ser persistente em hospedagens); senão, "musicas" ao lado do bot.py.
+MUSIC_DIR = os.getenv("MUSIC_DIR") or (
+    "/data/musicas"
+    if os.path.isdir("/data") and os.access("/data", os.W_OK)
+    else "musicas"
+)
+AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus", ".aac")
+MAX_AUDIO_BYTES = 50 * 1024 * 1024  # 50 MB por arquivo
 
 # Opcional: usado só para ÁLBUNS do Spotify (pela API oficial).
 # Playlists do Spotify são lidas pela página pública e não precisam
@@ -44,6 +61,12 @@ COOKIES_FILE = os.getenv("YTDLP_COOKIES", "cookies.txt")
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("Neko")
+
+try:
+    os.makedirs(MUSIC_DIR, exist_ok=True)
+    log.info("Pasta de músicas: %s", MUSIC_DIR)
+except OSError:
+    log.warning("Não consegui criar a pasta de músicas: %s", MUSIC_DIR)
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -84,6 +107,9 @@ FFMPEG_OPTIONS = {
     "options": "-vn",
 }
 
+# Arquivos locais não usam as opções de reconexão de rede.
+FFMPEG_LOCAL_OPTIONS = {"options": "-vn"}
+
 # Imagens aceitas nos comandos de avatar e banner.
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -117,6 +143,8 @@ class Track:
         self.requester = requester
         # Preenchido quando a faixa vem do rodízio de playlists.
         self.block_id = data.get("block_id")
+        # True quando é um arquivo da pasta de músicas.
+        self.local = bool(data.get("local"))
 
     async def ensure_stream(self):
         if self.stream:
@@ -129,6 +157,7 @@ class Track:
         self.duration = resolved.duration
         self.artist = resolved.artist
         self.thumbnail = resolved.thumbnail
+        self.local = resolved.local
 
 
 class PlaylistBlock:
@@ -181,6 +210,75 @@ def format_time(seconds):
     if hours:
         return f"{hours}:{minutes:02}:{secs:02}"
     return f"{minutes}:{secs:02}"
+
+
+# ---------------------------------------------------------------
+# Arquivos de música locais
+# ---------------------------------------------------------------
+
+def list_local_files():
+    """Nomes dos arquivos de áudio da pasta de músicas."""
+    if not os.path.isdir(MUSIC_DIR):
+        return []
+
+    return sorted(
+        name
+        for name in os.listdir(MUSIC_DIR)
+        if name.lower().endswith(AUDIO_EXTS)
+        and len(name) <= 100
+        and os.path.isfile(os.path.join(MUSIC_DIR, name))
+    )
+
+
+def safe_music_path(name):
+    """Caminho seguro de um arquivo da pasta de músicas."""
+    base = os.path.realpath(MUSIC_DIR)
+    path = os.path.realpath(os.path.join(base, os.path.basename(name)))
+
+    if (
+        not path.startswith(base + os.sep)
+        or not path.lower().endswith(AUDIO_EXTS)
+        or not os.path.isfile(path)
+    ):
+        raise ValueError("Arquivo não encontrado na pasta de músicas.")
+
+    return path
+
+
+def safe_filename(filename):
+    """Nome de arquivo limpo, sem pastas nem símbolos estranhos."""
+    stem, ext = os.path.splitext(os.path.basename(filename))
+    stem = re.sub(r"[^\w\s().,'&+-]", "_", stem).strip()[:80] or "musica"
+    return stem + ext.lower()
+
+
+def local_duration(path):
+    """Duração do arquivo em segundos (0 se não conseguir ler)."""
+    if MutagenFile is None:
+        return 0
+
+    try:
+        audio = MutagenFile(path)
+        return int(audio.info.length) if audio and audio.info else 0
+    except Exception:
+        return 0
+
+
+def local_track(name, requester):
+    path = safe_music_path(name)
+    filename = os.path.basename(path)
+
+    return Track(
+        {
+            "title": os.path.splitext(filename)[0],
+            "url": path,
+            "query": f"local:{filename}",
+            "uploader": "Arquivo local",
+            "duration": local_duration(path),
+            "local": True,
+        },
+        requester,
+    )
 
 
 async def extract_info(query):
@@ -256,12 +354,39 @@ async def search_soundcloud(text):
     raise ValueError("Nenhum áudio reproduzível encontrado.")
 
 
+NOISE_WORDS = {
+    "official", "oficial", "music", "video", "mv", "audio", "lyrics",
+    "lyric", "clipe", "hd", "4k", "full", "version",
+}
+
+
 def simplify_query(text):
-    """Versão mais simples da busca: sem feat., parênteses e símbolos."""
+    """Versão mais simples da busca: sem feat., símbolos e palavras
+    como 'Official Music Video'."""
     text = re.sub(r"[\(\[].*?[\)\]]", " ", text)
     text = re.sub(r"\b(feat|ft|featuring)\b\.?.*", " ", text, flags=re.I)
     text = re.sub(r"[^\w\s'-]", " ", text)
-    return re.sub(r"\s+", " ", text).strip()
+    words = [w for w in text.split() if w.lower() not in NOISE_WORDS]
+    return " ".join(words)
+
+
+def query_variants(text):
+    """Buscas a tentar no SoundCloud, da mais exata à mais simples."""
+    simple = simplify_query(text)
+    variants = [text, simple]
+
+    words = simple.split()
+    if len(words) > 3:
+        variants.append(" ".join(words[:3]))
+
+    seen = set()
+    result = []
+    for variant in variants:
+        key = variant.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            result.append(variant.strip())
+    return result
 
 
 async def search_text(text, skip_youtube=False):
@@ -278,11 +403,8 @@ async def search_text(text, skip_youtube=False):
                 clean_error(error),
             )
 
-    # SoundCloud: primeiro a busca original, depois uma simplificada.
-    queries = [text]
-    simple = simplify_query(text)
-    if simple and simple.lower() != text.lower():
-        queries.append(simple)
+    # SoundCloud: da busca original até uma versão simplificada.
+    queries = query_variants(text)
 
     sc_error = None
     for query in queries:
@@ -323,7 +445,7 @@ def friendly_reason(error):
     text = clean_error(error).lower()
 
     # Mensagem que o próprio bot já montou.
-    if text.startswith("não achei"):
+    if text.startswith("não achei") or text.startswith("arquivo não"):
         return clean_error(error)
 
     if "not a bot" in text or "sign in" in text:
@@ -412,6 +534,10 @@ def clean_video_title(title):
 
 
 async def resolve_track(query, requester):
+    # Arquivo da pasta de músicas (guardado como "local:nome.mp3").
+    if query.startswith("local:"):
+        return local_track(query[len("local:"):], requester)
+
     is_link = query.startswith(("http://", "https://"))
 
     # Busca por texto: YouTube primeiro, SoundCloud como reserva.
@@ -1303,10 +1429,14 @@ async def play_next(player):
                     await update_panel(player)
                     return
 
+        ffmpeg_options = (
+            FFMPEG_LOCAL_OPTIONS if track.local else FFMPEG_OPTIONS
+        )
+
         source = discord.PCMVolumeTransformer(
             discord.FFmpegPCMAudio(
                 track.stream,
-                **FFMPEG_OPTIONS,
+                **ffmpeg_options,
             ),
             volume=player.volume,
         )
@@ -2285,6 +2415,281 @@ async def lyrics_command(
 
 
 # ---------------------------------------------------------------
+# Músicas locais: /musica, /musica_todas, /musica_lista ...
+# ---------------------------------------------------------------
+
+async def local_file_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+):
+    return [
+        app_commands.Choice(name=name, value=name)
+        for name in list_local_files()
+        if current.lower() in name.lower()
+    ][:25]
+
+
+@bot.tree.command(
+    name="musica",
+    description="Toca um arquivo de música da pasta do bot.",
+)
+@app_commands.describe(nome="Nome do arquivo (comece a digitar)")
+async def local_play_command(
+    interaction: discord.Interaction,
+    nome: str,
+):
+    await interaction.response.defer(thinking=True)
+
+    try:
+        track = local_track(nome, interaction.user)
+    except ValueError as error:
+        await interaction.followup.send(
+            f"{error} Veja os nomes com `/musica_lista`."
+        )
+        return
+
+    player = await connect_voice(interaction)
+    if not player:
+        return
+
+    added, _ = add_tracks(player, [track])
+    if not added:
+        await interaction.followup.send("A fila atingiu o limite.")
+        return
+
+    await interaction.followup.send(
+        f"🎵 Adicionada à fila: **{track.title}**"
+    )
+    await kick(player)
+
+
+@local_play_command.autocomplete("nome")
+async def local_play_autocomplete(interaction, current):
+    return await local_file_autocomplete(interaction, current)
+
+
+@bot.tree.command(
+    name="musica_todas",
+    description="Coloca todos os arquivos da pasta de músicas na fila.",
+)
+@app_commands.describe(embaralhar="Embaralhar antes de adicionar")
+async def local_all_command(
+    interaction: discord.Interaction,
+    embaralhar: bool = False,
+):
+    await interaction.response.defer(thinking=True)
+
+    files = list_local_files()
+    if not files:
+        await interaction.followup.send(
+            "A pasta de músicas está vazia. O dono pode enviar "
+            "arquivos com `/musica_adicionar`."
+        )
+        return
+
+    player = await connect_voice(interaction)
+    if not player:
+        return
+
+    tracks = [
+        Track(
+            {
+                "title": os.path.splitext(name)[0],
+                "query": f"local:{name}",
+                "uploader": "Arquivo local",
+            },
+            interaction.user,
+        )
+        for name in files
+    ]
+    if embaralhar:
+        random.shuffle(tracks)
+
+    added, skipped = add_tracks(player, tracks)
+
+    message = f"📁 {added} músicas da pasta adicionadas à fila."
+    if skipped:
+        message += f" ({skipped} ficaram de fora: fila cheia.)"
+
+    await interaction.followup.send(message)
+    await kick(player)
+
+
+@bot.tree.command(
+    name="musica_lista",
+    description="Lista os arquivos da pasta de músicas.",
+)
+async def local_list_command(interaction: discord.Interaction):
+    files = list_local_files()
+
+    if not files:
+        await interaction.response.send_message(
+            "A pasta de músicas está vazia. O dono pode enviar "
+            "arquivos com `/musica_adicionar`.",
+            ephemeral=True,
+        )
+        return
+
+    lines = [f"{i}. {name}" for i, name in enumerate(files, 1)]
+    text = f"**{len(files)} arquivos**\n" + "\n".join(lines)
+    if len(text) > 1900:
+        text = text[:1900].rsplit("\n", 1)[0] + "\n..."
+
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@bot.tree.command(
+    name="musica_adicionar",
+    description="Adiciona até 10 arquivos de áudio à pasta do Neko.",
+)
+@app_commands.describe(
+    arquivo1="Primeiro arquivo de áudio",
+    arquivo2="Segundo arquivo de áudio (opcional)",
+    arquivo3="Terceiro arquivo de áudio (opcional)",
+    arquivo4="Quarto arquivo de áudio (opcional)",
+    arquivo5="Quinto arquivo de áudio (opcional)",
+    arquivo6="Sexto arquivo de áudio (opcional)",
+    arquivo7="Sétimo arquivo de áudio (opcional)",
+    arquivo8="Oitavo arquivo de áudio (opcional)",
+    arquivo9="Nono arquivo de áudio (opcional)",
+    arquivo10="Décimo arquivo de áudio (opcional)",
+)
+async def local_add_command(
+    interaction: discord.Interaction,
+    arquivo1: discord.Attachment,
+    arquivo2: discord.Attachment = None,
+    arquivo3: discord.Attachment = None,
+    arquivo4: discord.Attachment = None,
+    arquivo5: discord.Attachment = None,
+    arquivo6: discord.Attachment = None,
+    arquivo7: discord.Attachment = None,
+    arquivo8: discord.Attachment = None,
+    arquivo9: discord.Attachment = None,
+    arquivo10: discord.Attachment = None,
+):
+    """Permite que qualquer membro envie até 10 músicas por comando."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    attachments = [item for item in (
+        arquivo1, arquivo2, arquivo3, arquivo4, arquivo5,
+        arquivo6, arquivo7, arquivo8, arquivo9, arquivo10,
+    ) if item is not None]
+
+    if not attachments:
+        await interaction.followup.send(
+            "Anexe pelo menos um arquivo de áudio.", ephemeral=True
+        )
+        return
+
+    try:
+        os.makedirs(MUSIC_DIR, exist_ok=True)
+    except OSError as error:
+        log.error("Não consegui criar a pasta de músicas: %s", error)
+        await interaction.followup.send(
+            "Não consegui acessar a pasta de músicas da hospedagem.",
+            ephemeral=True,
+        )
+        return
+
+    added, skipped = [], []
+    for attachment in attachments:
+        name = safe_filename(attachment.filename)
+        if not name.lower().endswith(AUDIO_EXTS):
+            skipped.append(f"{attachment.filename}: formato não aceito")
+            continue
+        if attachment.size > MAX_AUDIO_BYTES:
+            skipped.append(f"{attachment.filename}: passa de 50 MB")
+            continue
+
+        path = os.path.join(MUSIC_DIR, name)
+        if os.path.exists(path):
+            # Evita sobrescrever arquivos já existentes; cria nome alternativo.
+            stem, ext = os.path.splitext(name)
+            counter = 2
+            while os.path.exists(path):
+                suffix = f" ({counter})"
+                path = os.path.join(MUSIC_DIR, f"{stem[:80-len(suffix)]}{suffix}{ext}")
+                counter += 1
+            name = os.path.basename(path)
+
+        try:
+            await attachment.save(path)
+            added.append(name)
+        except Exception as error:
+            log.error("Falha ao salvar %s: %s", name, error)
+            skipped.append(f"{attachment.filename}: falha ao salvar")
+            try:
+                if os.path.exists(path) and os.path.getsize(path) == 0:
+                    os.remove(path)
+            except OSError:
+                pass
+
+    lines = []
+    if added:
+        lines.append(f"✅ **{len(added)} arquivo(s) adicionado(s):**")
+        lines.extend(f"• {name}" for name in added[:15])
+        if len(added) > 15:
+            lines.append(f"• ... e mais {len(added) - 15} arquivo(s)")
+    if skipped:
+        lines.append(f"⚠️ **{len(skipped)} arquivo(s) não foram adicionados:**")
+        lines.extend(f"• {reason}" for reason in skipped[:10])
+    if added:
+        lines.append("Use `/musica` para tocar uma faixa ou `/musica_lista` para ver os arquivos.")
+        lines.append("Envie apenas músicas que você tem direito de usar.")
+    await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
+
+
+@bot.tree.command(
+    name="musica_remover",
+    description="Remove um ou vários arquivos de música (só o dono).",
+)
+@app_commands.describe(
+    nomes="Um ou mais nomes exatos, separados por vírgula ou por linha"
+)
+async def local_remove_command(
+    interaction: discord.Interaction,
+    nomes: str,
+):
+    if not await owner_only(interaction):
+        return
+
+    requested = [item.strip().strip('"\'') for item in re.split(r"[,\n]", nomes) if item.strip()]
+    if not requested:
+        await interaction.response.send_message(
+            "Informe pelo menos um nome de arquivo.", ephemeral=True
+        )
+        return
+
+    removed, failed = [], []
+    # Evita tentar apagar o mesmo arquivo mais de uma vez.
+    seen = set()
+    for name in requested:
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            path = safe_music_path(name)
+            os.remove(path)
+            removed.append(os.path.basename(path))
+        except (ValueError, OSError):
+            failed.append(name[:100])
+
+    lines = []
+    if removed:
+        lines.append(f"🗑 **{len(removed)} arquivo(s) removido(s):**")
+        lines.extend(f"• {name}" for name in removed[:15])
+        if len(removed) > 15:
+            lines.append(f"• ... e mais {len(removed) - 15} arquivo(s)")
+    if failed:
+        lines.append(f"⚠️ **{len(failed)} não encontrado(s) ou não removido(s):**")
+        lines.extend(f"• {name}" for name in failed[:10])
+    await interaction.response.send_message(
+        "\n".join(lines)[:1900] or "Nenhum arquivo foi removido.",
+        ephemeral=True,
+    )
+
+
+# ---------------------------------------------------------------
 # Playlists criadas pelo bot: /lista ...
 # ---------------------------------------------------------------
 
@@ -2806,6 +3211,10 @@ async def help_command(interaction: discord.Interaction):
             "`/parar` • Para e limpa fila e rodízio\n"
             "`/sair` • Desconecta do canal\n"
             "`/letra [musica]` • Pesquisa letras\n"
+            "\n**Arquivos de música**\n"
+            "`/musica nome` • Toca um arquivo da pasta\n"
+            "`/musica_todas` • Toca todos os arquivos (opção de embaralhar)\n"
+            "`/musica_lista` • Lista os arquivos\n"
             "\n**Rodízio de playlists**\n"
             "`/playduspika link` • Entra na sequência de playlists\n"
             "`/playduspika_lista` • Vê, remove ou substitui playlists\n"
@@ -2816,6 +3225,9 @@ async def help_command(interaction: discord.Interaction):
             "`/lista ver [nome]` • Lista playlists ou faixas\n"
             "`/lista remover_faixa nome numero` • Tira uma faixa\n"
             "`/lista apagar nome` • Apaga a playlist\n"
+            "\n**Gerenciamento de arquivos**\n"
+            "`/musica_adicionar` • Qualquer membro pode enviar até 10 arquivos por vez\n"
+            "`/musica_remover nomes` • Remove vários arquivos (só o dono)\n"
             "\n**Somente o dono do bot**\n"
             "`/avatar_definir` • Define o avatar (foto/GIF)\n"
             "`/avatar_remover` • Remove o avatar\n"
