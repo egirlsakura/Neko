@@ -46,7 +46,7 @@ MUSIC_DIR = os.getenv("MUSIC_DIR") or (
     else "musicas"
 )
 AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".flac", ".m4a", ".opus", ".aac")
-MAX_AUDIO_BYTES = 50 * 1024 * 1024  # 50 MB por arquivo
+MAX_AUDIO_BYTES = 100 * 1024 * 1024  # 100 MB por arquivo
 
 # Opcional: usado só para ÁLBUNS do Spotify (pela API oficial).
 # Playlists do Spotify são lidas pela página pública e não precisam
@@ -2597,7 +2597,7 @@ async def local_add_command(
             skipped.append(f"{attachment.filename}: formato não aceito")
             continue
         if attachment.size > MAX_AUDIO_BYTES:
-            skipped.append(f"{attachment.filename}: passa de 50 MB")
+            skipped.append(f"{attachment.filename}: passa de 100 MB")
             continue
 
         path = os.path.join(MUSIC_DIR, name)
@@ -2640,10 +2640,10 @@ async def local_add_command(
 
 @bot.tree.command(
     name="musica_remover",
-    description="Remove um ou vários arquivos de música (só o dono).",
+    description="Remove arquivos por número da lista ou nome (só o dono).",
 )
 @app_commands.describe(
-    nomes="Um ou mais nomes exatos, separados por vírgula ou por linha"
+    nomes="Números da lista e/ou nomes exatos; separe por vírgula ou linha"
 )
 async def local_remove_command(
     interaction: discord.Interaction,
@@ -2652,25 +2652,64 @@ async def local_remove_command(
     if not await owner_only(interaction):
         return
 
-    requested = [item.strip().strip('"\'') for item in re.split(r"[,\n]", nomes) if item.strip()]
-    if not requested:
+    # Usa a mesma ordem alfabética exibida em /musica_lista.
+    files = list_local_files()
+    if not files:
         await interaction.response.send_message(
-            "Informe pelo menos um nome de arquivo.", ephemeral=True
+            "A pasta de músicas está vazia.", ephemeral=True
         )
         return
 
-    removed, failed = [], []
-    # Evita tentar apagar o mesmo arquivo mais de uma vez.
+    requested = [
+        item.strip().strip('"\'')
+        for item in re.split(r"[,;\n]+", nomes)
+        if item.strip()
+    ]
+    if not requested:
+        await interaction.response.send_message(
+            "Informe números da lista ou nomes de arquivos. Exemplo: `1, 3, musica.mp3`.",
+            ephemeral=True,
+        )
+        return
+
+    # Índice por nome completo e por título sem extensão, ignorando maiúsculas.
+    by_name = {name.casefold(): name for name in files}
+    by_title = {}
+    for name in files:
+        by_title.setdefault(os.path.splitext(name)[0].casefold(), []).append(name)
+
+    targets, failed = [], []
     seen = set()
-    for name in requested:
-        key = name.casefold()
-        if key in seen:
+    for item in requested:
+        match = None
+        if item.isdigit():
+            position = int(item)
+            if 1 <= position <= len(files):
+                match = files[position - 1]
+        else:
+            cleaned = os.path.basename(item).strip()
+            match = by_name.get(cleaned.casefold())
+            if match is None:
+                title_matches = by_title.get(os.path.splitext(cleaned)[0].casefold(), [])
+                if len(title_matches) == 1:
+                    match = title_matches[0]
+                elif len(title_matches) > 1:
+                    failed.append(f"{item[:80]} (título ambíguo; use o nome completo com extensão)")
+                    continue
+
+        if match is None:
+            failed.append(item[:100])
             continue
-        seen.add(key)
+        key = match.casefold()
+        if key not in seen:
+            seen.add(key)
+            targets.append(match)
+
+    removed = []
+    for name in targets:
         try:
-            path = safe_music_path(name)
-            os.remove(path)
-            removed.append(os.path.basename(path))
+            os.remove(safe_music_path(name))
+            removed.append(name)
         except (ValueError, OSError):
             failed.append(name[:100])
 
@@ -2681,13 +2720,12 @@ async def local_remove_command(
         if len(removed) > 15:
             lines.append(f"• ... e mais {len(removed) - 15} arquivo(s)")
     if failed:
-        lines.append(f"⚠️ **{len(failed)} não encontrado(s) ou não removido(s):**")
+        lines.append(f"⚠️ **{len(failed)} item(ns) não encontrado(s) ou não removido(s):**")
         lines.extend(f"• {name}" for name in failed[:10])
     await interaction.response.send_message(
         "\n".join(lines)[:1900] or "Nenhum arquivo foi removido.",
         ephemeral=True,
     )
-
 
 # ---------------------------------------------------------------
 # Playlists criadas pelo bot: /lista ...
@@ -3227,7 +3265,7 @@ async def help_command(interaction: discord.Interaction):
             "`/lista apagar nome` • Apaga a playlist\n"
             "\n**Gerenciamento de arquivos**\n"
             "`/musica_adicionar` • Qualquer membro pode enviar até 10 arquivos por vez\n"
-            "`/musica_remover nomes` • Remove vários arquivos (só o dono)\n"
+            "`/musica_remover nomes` • Remove por número ou nome (só o dono)\n"
             "\n**Somente o dono do bot**\n"
             "`/avatar_definir` • Define o avatar (foto/GIF)\n"
             "`/avatar_remover` • Remove o avatar\n"
